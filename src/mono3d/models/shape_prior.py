@@ -562,17 +562,22 @@ class ShapeVAE(nn.Module):
         decoder_type = decoder.get('type', 'mlp')
         decoder_hidden_dims = decoder.get('hidden_dims', [512, 512, 256])
         output_dim = decoder.get('output_dim', 3)
-        
+        self.num_output_points = decoder.get('num_points', 1024)
+
+        if decoder_type != 'mlp':
+            raise ValueError(f"Unsupported decoder type: {decoder_type}")
+
         self.decoder = MLP(
             input_dim=latent_dim,
             hidden_dims=decoder_hidden_dims,
-            output_dim=output_dim * 2048,  # 假设输出2048个点
+            output_dim=output_dim * self.num_output_points,
             activation='relu',
         )
-        
-        self.num_output_points = 2048
-        
-        log.info(f"Initialized ShapeVAE (latent_dim={latent_dim})")
+        log.info(
+            "Initialized ShapeVAE (latent_dim=%d, num_points=%d)",
+            latent_dim,
+            self.num_output_points,
+        )
     
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """编码到潜在空间

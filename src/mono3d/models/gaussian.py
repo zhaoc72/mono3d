@@ -164,15 +164,17 @@ class GaussianModel(nn.Module):
             # 上采样（复制+扰动）
             repeat_times = self.num_gaussians // num_points + 1
             points = points.repeat(repeat_times, 1)[:self.num_gaussians]
-            
+
             # 添加小扰动
             noise = torch.randn_like(points) * 0.01
             points = points + noise
-            
+
             if colors is not None:
                 colors = colors.repeat(repeat_times, 1)[:self.num_gaussians]
             if normals is not None:
                 normals = normals.repeat(repeat_times, 1)[:self.num_gaussians]
+
+        num_points = points.shape[0]
         
         # 设置位置
         self._xyz.data = points.to(self._xyz.device)
@@ -409,18 +411,65 @@ class GaussianModel(nn.Module):
     def _prune_gaussians(self, mask: torch.Tensor):
         """修剪高斯（移除mask为True的）"""
         keep_mask = ~mask
-        
+
         self._xyz = nn.Parameter(self._xyz.data[keep_mask])
         self._scaling = nn.Parameter(self._scaling.data[keep_mask])
         self._rotation = nn.Parameter(self._rotation.data[keep_mask])
         self._features_dc = nn.Parameter(self._features_dc.data[keep_mask])
         self._features_rest = nn.Parameter(self._features_rest.data[keep_mask])
         self._opacity = nn.Parameter(self._opacity.data[keep_mask])
-        
+
         self.xyz_gradient_accum = self.xyz_gradient_accum[keep_mask]
         self.denom = self.denom[keep_mask]
-        
+
         self.num_gaussians = self._xyz.shape[0]
+
+    def optimize(
+        self,
+        images: torch.Tensor,
+        depths: Optional[torch.Tensor] = None,
+        masks: Optional[torch.Tensor] = None,
+        cameras: Optional[List[Dict[str, Any]]] = None,
+        iterations: int = 3000,
+        **kwargs,
+    ) -> "GaussianModel":
+        """实例方法封装 ``optimize_gaussians``。
+
+        Args:
+            images: 目标图像 ``(B, 3, H, W)``。
+            depths: 深度图 ``(B, 1, H, W)``。
+            masks: 掩码 ``(B, 1, H, W)``。
+            cameras: 相机参数列表。
+            iterations: 迭代次数。
+            **kwargs: 额外的优化参数。
+
+        Returns:
+            优化后的 ``GaussianModel``（原地更新后返回自身）。
+        """
+
+        if cameras is None:
+            cameras = [self._get_default_camera()]
+
+        if masks is None:
+            masks = torch.ones(
+                images.shape[0],
+                1,
+                images.shape[2],
+                images.shape[3],
+                device=images.device,
+            )
+
+        optimize_gaussians(
+            gaussian_model=self,
+            images=images,
+            depths=depths,
+            masks=masks,
+            cameras=cameras,
+            iterations=iterations,
+            **kwargs,
+        )
+
+        return self
     
     def to_pointcloud(self) -> Dict[str, np.ndarray]:
         """转换为点云

@@ -8,6 +8,7 @@
 """
 
 from .frontend import DINOv3, SAM2, DepthAnything
+from .detector import GroundingDINODetector
 from .shape_prior import ExplicitShapePrior, ImplicitShapePrior, ShapeVAE
 from .gaussian import GaussianModel, GaussianRenderer
 from .initializer import ShapeInitNet
@@ -28,6 +29,7 @@ from ..registry import register
 register('model', 'dinov3')(DINOv3)
 register('model', 'sam2')(SAM2)
 register('model', 'depth_anything')(DepthAnything)
+register('model', 'grounding_dino')(GroundingDINODetector)
 
 # 注册形状先验
 register('model', 'explicit_prior')(ExplicitShapePrior)
@@ -45,6 +47,7 @@ __all__ = [
     'DINOv3',
     'SAM2',
     'DepthAnything',
+    'GroundingDINODetector',
     # Shape Prior
     'ExplicitShapePrior',
     'ImplicitShapePrior',

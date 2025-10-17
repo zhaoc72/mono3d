@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 import torch
-import cv2
 import json
 import logging
+
+try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    cv2 = None
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +241,9 @@ def extract_video_frames(
     Returns:
         提取的帧路径列表（如果保存）或帧数组列表
     """
+    if cv2 is None:
+        raise ImportError("OpenCV is required for extract_video_frames but is not available")
+
     video_path = Path(video_path)
     
     if not video_path.exists():
@@ -360,8 +367,12 @@ def depth_to_pointcloud(
     # 添加颜色
     if color is not None:
         if color.shape[:2] != (h, w):
-            # 调整颜色图大小
-            color = cv2.resize(color, (w, h))
+            if cv2 is not None:
+                color = cv2.resize(color, (w, h))
+            else:  # pragma: no cover - executed only when OpenCV is unavailable
+                from PIL import Image
+
+                color = np.array(Image.fromarray(color).resize((w, h)))
         
         colors = color[valid]
         result['colors'] = colors / 255.0  # 归一化到 [0, 1]

@@ -76,7 +76,13 @@ class DINOv3(nn.Module):
     def _create_fallback_model(self):
         """创建回退模型（简化的CNN）"""
         import torchvision.models as models
-        resnet = models.resnet50(pretrained=True)
+
+        # 使用随机初始化的ResNet，避免在无网络环境下下载权重
+        try:
+            resnet = models.resnet50(weights=None)
+        except TypeError:  # 兼容旧版torchvision API
+            resnet = models.resnet50(pretrained=False)
+
         # 移除最后的全连接层
         return nn.Sequential(*list(resnet.children())[:-2])
     

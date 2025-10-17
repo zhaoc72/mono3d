@@ -3,7 +3,7 @@
 提供文件读写功能，支持点云、网格、模型保存和加载。
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import numpy as np
 import torch
 from pathlib import Path

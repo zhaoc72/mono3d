@@ -13,6 +13,8 @@ import json
 import pickle
 import logging
 
+from omegaconf import OmegaConf
+
 from .base import BaseDataset, MultiViewDataset, VideoDataset
 from .utils import CameraParams, read_camera_params, depth_to_pointcloud
 from .transforms import get_default_transforms
@@ -892,6 +894,17 @@ def build_dataset(cfg, split: str = 'train', **kwargs) -> BaseDataset:
     Returns:
         数据集实例
     """
+    defaults = OmegaConf.create({
+        "data": {
+            "root": "./data",
+            "cache": {"enabled": False, "cache_dir": None},
+            "shuffle": True,
+            "pin_memory": False,
+        },
+        "num_workers": 0,
+    })
+    cfg = OmegaConf.merge(defaults, cfg)
+
     dataset_name = cfg.data.name.lower()
     
     # 构建变换
@@ -944,9 +957,19 @@ def build_dataloader(
     Returns:
         DataLoader实例
     """
+    defaults = OmegaConf.create({
+        "data": {
+            "shuffle": True,
+            "pin_memory": False,
+            "batch_size": 1,
+        },
+        "num_workers": 0,
+    })
+    cfg = OmegaConf.merge(defaults, cfg)
+
     # 构建数据集
     dataset = build_dataset(cfg, split=split)
-    
+
     # DataLoader参数
     batch_size = kwargs.pop('batch_size', cfg.data.batch_size)
     shuffle = kwargs.pop('shuffle', split == 'train' and cfg.data.shuffle)

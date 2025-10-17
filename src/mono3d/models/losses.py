@@ -3,7 +3,7 @@
 实现各种用于3D重建的损失函数。
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
