@@ -7,6 +7,7 @@ from mono3d.models import (
     GaussianModel,
     ShapeVAE,
     DINOv3,
+    GroundingDINODetector,
 )
 from mono3d.models.networks import MLP, PointNetEncoder
 from mono3d.models.losses import (
@@ -31,6 +32,20 @@ class TestNetworks:
         output = mlp(x)
         
         assert output.shape == (4, 128)
+
+class TestDetector:
+    """Tests for the Grounding DINO detector wrapper."""
+
+    def test_fallback_detection(self):
+        detector = GroundingDINODetector()
+        image = torch.rand(1, 3, 64, 64)
+
+        detections = detector(image, text_prompts="chair")
+
+        assert "boxes" in detections
+        assert detections["boxes"].shape == (1, 1, 4)
+        assert detections["scores"].shape == (1, 1)
+        assert detections["labels"][0][0] == "chair"
     
     def test_pointnet_encoder(self, dummy_pointcloud):
         """Test PointNet encoder"""

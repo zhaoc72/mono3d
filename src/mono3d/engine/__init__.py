@@ -15,7 +15,6 @@ from .trainer import (
 from .inferencer import (
     SingleImageInferencer,
     VideoInferencer,
-    BatchInferencer,
     infer,
 )
 
@@ -35,7 +34,6 @@ __all__ = [
     # Inferencer
     'SingleImageInferencer',
     'VideoInferencer',
-    'BatchInferencer',
     'infer',
     # Evaluator
     'Evaluator',
