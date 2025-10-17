@@ -28,7 +28,7 @@ class TestTrainer:
                 return {'loss': 1.0}
         
         trainer = DummyTrainer(test_config, device)
-        
+
         assert trainer.model is not None
         assert trainer.optimizer is not None
     
@@ -55,9 +55,16 @@ class TestTrainer:
         
         # Load checkpoint
         trainer.load_checkpoint(checkpoint_path)
+<<<<<<< ours
         
         assert trainer.current_epoch >= 0
 
+=======
+
+        assert trainer.current_epoch >= 0
+
+
+>>>>>>> theirs
 class TestInferencer:
     """Tests for the single image inferencer."""
 

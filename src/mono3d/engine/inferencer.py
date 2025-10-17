@@ -18,6 +18,10 @@ from ..utils.io import save_mesh, save_pointcloud
 
 log = logging.getLogger(__name__)
 
+<<<<<<< ours
+=======
+
+>>>>>>> theirs
 def _to_container(cfg_section: Any) -> Dict[str, Any]:
     """将OmegaConf节点安全转换为dict。"""
 
@@ -35,19 +39,31 @@ def infer(cfg: DictConfig) -> None:
     input_path = cfg.get("input", cfg.get("image", None))
     if input_path is None:
         raise ValueError("Please specify input image or video path via cfg.input")
+<<<<<<< ours
     
     input_path = Path(input_path)
     
+=======
+
+    input_path = Path(input_path)
+>>>>>>> theirs
     inferencer: BaseInferencer
 
     if input_path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
         inferencer = SingleImageInferencer(cfg, device)
+<<<<<<< ours
         
+=======
+>>>>>>> theirs
     elif input_path.suffix.lower() in {".mp4", ".avi", ".mov"}:
         inferencer = VideoInferencer(cfg, device)
     else:
         raise ValueError(f"Unsupported input format: {input_path.suffix}")
+<<<<<<< ours
     
+=======
+
+>>>>>>> theirs
     result = inferencer.infer(input_path)
 
     inference_cfg = _to_container(cfg.get("inference", {}))
@@ -56,7 +72,7 @@ def infer(cfg: DictConfig) -> None:
     output_root = Path(cfg.paths.output_dir) if hasattr(cfg, "paths") else Path("outputs")
     output_dir = output_root / "reconstructions"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     output_name = input_path.stem
     if export_format in {"ply", "both"} and "pointcloud" in result:
         save_pointcloud(result["pointcloud"], output_dir / f"{output_name}.ply")
@@ -72,8 +88,13 @@ class BaseInferencer:
     def __init__(self, cfg: DictConfig, device: torch.device) -> None:
         self.cfg = cfg
         self.device = device
+<<<<<<< ours
         
         def infer(self, input_path: Path) -> Dict[str, Any]:  # pragma: no cover - interface
+=======
+
+    def infer(self, input_path: Path) -> Dict[str, Any]:  # pragma: no cover - interface
+>>>>>>> theirs
         raise NotImplementedError
 
 
@@ -128,7 +149,11 @@ class SingleImageInferencer(BaseInferencer):
     def _build_gaussian_model(self):
         model = build("model", "gaussian", **self.gaussian_cfg)
         return model.to(self.device)
+<<<<<<< ours
     
+=======
+
+>>>>>>> theirs
     @torch.no_grad()
     def infer(self, image_path: Path) -> Dict[str, Any]:
         log.info("Processing %s", image_path)
@@ -157,7 +182,11 @@ class SingleImageInferencer(BaseInferencer):
             "optimization_iterations",
             self.gaussian_opt_cfg.get("iterations", 300),
         )
+<<<<<<< ours
         
+=======
+
+>>>>>>> theirs
         gaussian_camera = [self._camera_to_gaussian(camera, mask.shape[-2:])]
         if iterations > 0:
             gaussian_model.optimize(
@@ -173,8 +202,13 @@ class SingleImageInferencer(BaseInferencer):
             "mesh": gaussian_model.to_mesh(),
             "gaussian": gaussian_model,
         }
+<<<<<<< ours
         
         def _preprocess_image(self, image: Image.Image) -> torch.Tensor:
+=======
+
+    def _preprocess_image(self, image: Image.Image) -> torch.Tensor:
+>>>>>>> theirs
         array = np.array(image).astype(np.float32) / 255.0
         tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
         return tensor.to(self.device)
@@ -345,4 +379,9 @@ __all__ = [
     "infer",
     "SingleImageInferencer",
     "VideoInferencer",
+<<<<<<< ours
 ]
+=======
+]
+
+>>>>>>> theirs

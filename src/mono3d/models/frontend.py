@@ -82,7 +82,11 @@ class DINOv3(nn.Module):
             resnet = models.resnet50(weights=None)
         except TypeError:  # 兼容旧版torchvision API
             resnet = models.resnet50(pretrained=False)
+<<<<<<< ours
             
+=======
+
+>>>>>>> theirs
         # 移除最后的全连接层
         return nn.Sequential(*list(resnet.children())[:-2])
     

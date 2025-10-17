@@ -8,6 +8,8 @@ import logging
 from tqdm import tqdm
 import time
 
+from omegaconf import OmegaConf
+
 from ..registry import build
 from ..data.datasets import build_dataloader
 from ..utils.logger import setup_logger, WandbLogger, TensorBoardLogger
@@ -78,12 +80,65 @@ class BaseTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_metric = float('inf')
-        
+
+        # ------------------------------------------------------------------
+        # Resolve optional configuration sections with sensible defaults so
+        # the trainer can be instantiated in lightweight unit tests that only
+        # provide a subset of the full Hydra configuration.
+        # ------------------------------------------------------------------
+        default_paths = OmegaConf.create({
+            "output_dir": "./outputs",
+            "checkpoint_dir": "./outputs/checkpoints",
+            "log_dir": "./outputs/logs",
+        })
+        self.paths = OmegaConf.merge(
+            default_paths,
+            cfg.get("paths") or OmegaConf.create({})
+        )
+
+        default_logging = OmegaConf.create({
+            "use_wandb": False,
+            "wandb_project": "mono3d",
+        })
+        self.logging_cfg = OmegaConf.merge(
+            default_logging,
+            cfg.get("logging") or OmegaConf.create({})
+        )
+
+        default_amp = OmegaConf.create({"enabled": False})
+        self.amp_cfg = OmegaConf.merge(
+            default_amp,
+            cfg.get("amp") or OmegaConf.create({})
+        )
+
+        default_training = OmegaConf.create({
+            "epochs": 1,
+            "optimizer": {
+                "type": "adam",
+                "lr": 1e-4,
+                "weight_decay": 0.0,
+                "betas": (0.9, 0.999),
+            },
+            "scheduler": {"type": "none"},
+            "validation": {"interval": 1},
+            "early_stopping": {
+                "enabled": False,
+                "metric": "loss",
+                "mode": "min",
+                "patience": 5,
+            },
+            "gradient_clip": 0.0,
+        })
+        self.training_cfg = OmegaConf.merge(
+            default_training,
+            cfg.get("training") or OmegaConf.create({})
+        )
+
         # 创建输出目录
-        self.output_dir = Path(cfg.paths.output_dir)
+        self.output_dir = Path(self.paths.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.checkpoint_dir = Path(cfg.paths.checkpoint_dir)
+
+        self.checkpoint_dir = Path(self.paths.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # 构建数据加载器
@@ -102,16 +157,16 @@ class BaseTrainer:
         log.info("Building optimizer...")
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
-        
+
         # AMP
-        self.use_amp = cfg.amp.enabled
+        self.use_amp = bool(self.amp_cfg.enabled)
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
-        
+
         # 日志记录器
         self.setup_loggers()
-        
+
         # 早停
-        self.early_stopping_patience = cfg.training.early_stopping.patience
+        self.early_stopping_patience = self.training_cfg.early_stopping.patience
         self.early_stopping_counter = 0
         
         log.info("Trainer initialized")
@@ -121,18 +176,18 @@ class BaseTrainer:
         self.loggers = []
         
         # W&B
-        if self.cfg.logging.use_wandb:
+        if bool(self.logging_cfg.use_wandb):
             wandb_logger = WandbLogger(
-                project=self.cfg.logging.wandb_project,
+                project=self.logging_cfg.wandb_project,
                 name=f"{self.cfg.project_name}_{time.strftime('%Y%m%d_%H%M%S')}",
                 config=dict(self.cfg),
                 enabled=True
             )
             self.loggers.append(wandb_logger)
-        
+
         # TensorBoard
         tb_logger = TensorBoardLogger(
-            log_dir=self.cfg.paths.log_dir,
+            log_dir=self.paths.log_dir,
             enabled=True
         )
         self.loggers.append(tb_logger)
@@ -143,21 +198,21 @@ class BaseTrainer:
     
     def build_optimizer(self):
         """构建优化器"""
-        opt_cfg = self.cfg.training.optimizer
+        opt_cfg = self.training_cfg.optimizer
         
         if opt_cfg.type == "adamw":
             return torch.optim.AdamW(
                 self.model.parameters(),
                 lr=opt_cfg.lr,
                 weight_decay=opt_cfg.weight_decay,
-                betas=opt_cfg.betas
+                betas=opt_cfg.get("betas", (0.9, 0.999))
             )
         elif opt_cfg.type == "adam":
             return torch.optim.Adam(
                 self.model.parameters(),
                 lr=opt_cfg.lr,
                 weight_decay=opt_cfg.weight_decay,
-                betas=opt_cfg.betas
+                betas=opt_cfg.get("betas", (0.9, 0.999))
             )
         elif opt_cfg.type == "sgd":
             return torch.optim.SGD(
@@ -171,12 +226,12 @@ class BaseTrainer:
     
     def build_scheduler(self):
         """构建学习率调度器"""
-        sch_cfg = self.cfg.training.scheduler
+        sch_cfg = self.training_cfg.scheduler
         
         if sch_cfg.type == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=self.cfg.training.epochs,
+                T_max=self.training_cfg.epochs,
                 eta_min=sch_cfg.min_lr
             )
         elif sch_cfg.type == "step":
@@ -205,10 +260,10 @@ class BaseTrainer:
         
         start_epoch = self.current_epoch
         
-        for epoch in range(start_epoch, self.cfg.training.epochs):
+        for epoch in range(start_epoch, self.training_cfg.epochs):
             self.current_epoch = epoch
             
-            log.info(f"\nEpoch {epoch + 1}/{self.cfg.training.epochs}")
+            log.info(f"\nEpoch {epoch + 1}/{self.training_cfg.epochs}")
             
             # 训练一个epoch
             train_metrics = self.train_epoch()
@@ -218,7 +273,7 @@ class BaseTrainer:
             log.info(f"Train - {self._format_metrics(train_metrics)}")
             
             # 验证
-            if (epoch + 1) % self.cfg.training.validation.interval == 0:
+            if (epoch + 1) % self.training_cfg.validation.interval == 0:
                 val_metrics = self.validate()
                 self.log_metrics(val_metrics, prefix="val/")
                 log.info(f"Val - {self._format_metrics(val_metrics)}")
@@ -232,7 +287,7 @@ class BaseTrainer:
                     self.early_stopping_counter += 1
                 
                 # 早停检查
-                if self.cfg.training.early_stopping.enabled:
+                if self.training_cfg.early_stopping.enabled:
                     if self.early_stopping_counter >= self.early_stopping_patience:
                         log.info(f"Early stopping triggered after {epoch + 1} epochs")
                         break
@@ -270,8 +325,8 @@ class BaseTrainer:
     
     def is_best(self, metrics: Dict[str, float]) -> bool:
         """判断是否最佳"""
-        metric_name = self.cfg.training.early_stopping.metric
-        mode = self.cfg.training.early_stopping.mode
+        metric_name = self.training_cfg.early_stopping.metric
+        mode = self.training_cfg.early_stopping.mode
         
         current = metrics.get(metric_name, float('inf'))
         
@@ -307,10 +362,14 @@ class BaseTrainer:
         
         torch.save(checkpoint, checkpoint_path)
         log.info(f"Checkpoint saved: {checkpoint_path}")
-    
+
     def load_checkpoint(self, checkpoint_path: Path):
         """加载检查点"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -394,11 +453,11 @@ class ShapePriorTrainer(BaseTrainer):
                 self.scaler.scale(loss).backward()
                 
                 # 梯度裁剪
-                if self.cfg.training.gradient_clip > 0:
+                if self.training_cfg.gradient_clip > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
-                        self.cfg.training.gradient_clip
+                        self.training_cfg.gradient_clip
                     )
                 
                 self.scaler.step(self.optimizer)
@@ -406,10 +465,10 @@ class ShapePriorTrainer(BaseTrainer):
             else:
                 loss.backward()
                 
-                if self.cfg.training.gradient_clip > 0:
+                if self.training_cfg.gradient_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
-                        self.cfg.training.gradient_clip
+                        self.training_cfg.gradient_clip
                     )
                 
                 self.optimizer.step()

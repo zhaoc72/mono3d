@@ -164,15 +164,17 @@ class GaussianModel(nn.Module):
             # 上采样（复制+扰动）
             repeat_times = self.num_gaussians // num_points + 1
             points = points.repeat(repeat_times, 1)[:self.num_gaussians]
-            
+
             # 添加小扰动
             noise = torch.randn_like(points) * 0.01
             points = points + noise
-            
+
             if colors is not None:
                 colors = colors.repeat(repeat_times, 1)[:self.num_gaussians]
             if normals is not None:
                 normals = normals.repeat(repeat_times, 1)[:self.num_gaussians]
+
+        num_points = points.shape[0]
         
         num_points = points.shape[0]
 
@@ -411,20 +413,23 @@ class GaussianModel(nn.Module):
     def _prune_gaussians(self, mask: torch.Tensor):
         """修剪高斯（移除mask为True的）"""
         keep_mask = ~mask
-        
+
         self._xyz = nn.Parameter(self._xyz.data[keep_mask])
         self._scaling = nn.Parameter(self._scaling.data[keep_mask])
         self._rotation = nn.Parameter(self._rotation.data[keep_mask])
         self._features_dc = nn.Parameter(self._features_dc.data[keep_mask])
         self._features_rest = nn.Parameter(self._features_rest.data[keep_mask])
         self._opacity = nn.Parameter(self._opacity.data[keep_mask])
-        
+
         self.xyz_gradient_accum = self.xyz_gradient_accum[keep_mask]
         self.denom = self.denom[keep_mask]
-        
+
         self.num_gaussians = self._xyz.shape[0]
 
+<<<<<<< ours
 
+=======
+>>>>>>> theirs
     def optimize(
         self,
         images: torch.Tensor,

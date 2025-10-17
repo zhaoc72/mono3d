@@ -1,10 +1,26 @@
 """Pytest configuration and fixtures"""
 
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import numpy as np
-from pathlib import Path
 from omegaconf import OmegaConf
+
+
+# ---------------------------------------------------------------------------
+# Ensure the project package (``mono3d``) is importable when tests are invoked
+# directly from the repository root without installing the package.  Pytest's
+# discovery does not automatically add the ``src`` layout to ``sys.path`` so we
+# append it manually here before importing any project modules.
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_PATH = PROJECT_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
 
 
 @pytest.fixture

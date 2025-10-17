@@ -11,6 +11,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 import random
 
+from omegaconf import OmegaConf
+
 
 class Compose:
     """组合多个变换"""
@@ -271,6 +273,26 @@ def get_default_transforms(cfg, split: str = 'train'):
     Returns:
         Compose变换
     """
+    base_cfg = OmegaConf.create({
+        "image": {
+            "size": [256, 256],
+            "normalize": {
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5],
+            },
+        },
+        "augmentation": {
+            "enabled": False,
+            "random_flip": 0.0,
+            "random_crop": False,
+            "color_jitter": None,
+        },
+        "model": {
+            "depth": {"max_depth": 10.0},
+        },
+    })
+    cfg = OmegaConf.merge(base_cfg, cfg)
+
     transforms_list = []
     
     # 调整大小
@@ -278,10 +300,10 @@ def get_default_transforms(cfg, split: str = 'train'):
         transforms_list.append(Resize(cfg.image.size))
     
     # 数据增强（仅训练集）
-    if split == 'train' and cfg.augmentation.enabled:
-        if cfg.augmentation.random_flip > 0:
+    if split == 'train' and bool(cfg.augmentation.enabled):
+        if cfg.augmentation.random_flip and cfg.augmentation.random_flip > 0:
             transforms_list.append(RandomFlip(p=cfg.augmentation.random_flip))
-        
+
         if cfg.augmentation.get('color_jitter'):
             jitter = cfg.augmentation.color_jitter
             transforms_list.append(

@@ -61,38 +61,46 @@ def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     trace = r00 + r11 + r22
     
     quat = torch.zeros(batch_size, 4, device=R.device)
-    
+    remaining = torch.ones(batch_size, dtype=torch.bool, device=R.device)
+
     # Case 1: trace > 0
-    mask = trace > 0
-    s = torch.sqrt(trace[mask] + 1.0) * 2
-    quat[mask, 0] = 0.25 * s
-    quat[mask, 1] = (r21[mask] - r12[mask]) / s
-    quat[mask, 2] = (r02[mask] - r20[mask]) / s
-    quat[mask, 3] = (r10[mask] - r01[mask]) / s
-    
+    mask = (trace > 0) & remaining
+    if mask.any():
+        s = torch.sqrt(trace[mask] + 1.0) * 2
+        quat[mask, 0] = 0.25 * s
+        quat[mask, 1] = (r21[mask] - r12[mask]) / s
+        quat[mask, 2] = (r02[mask] - r20[mask]) / s
+        quat[mask, 3] = (r10[mask] - r01[mask]) / s
+        remaining = remaining & (~mask)
+
     # Case 2: r00 > r11 and r00 > r22
-    mask = (~mask) & (r00 > r11) & (r00 > r22)
-    s = torch.sqrt(1.0 + r00[mask] - r11[mask] - r22[mask]) * 2
-    quat[mask, 0] = (r21[mask] - r12[mask]) / s
-    quat[mask, 1] = 0.25 * s
-    quat[mask, 2] = (r01[mask] + r10[mask]) / s
-    quat[mask, 3] = (r02[mask] + r20[mask]) / s
-    
+    mask = remaining & (r00 > r11) & (r00 > r22)
+    if mask.any():
+        s = torch.sqrt(1.0 + r00[mask] - r11[mask] - r22[mask]) * 2
+        quat[mask, 0] = (r21[mask] - r12[mask]) / s
+        quat[mask, 1] = 0.25 * s
+        quat[mask, 2] = (r01[mask] + r10[mask]) / s
+        quat[mask, 3] = (r02[mask] + r20[mask]) / s
+        remaining = remaining & (~mask)
+
     # Case 3: r11 > r22
-    mask = (~mask) & (r11 > r22)
-    s = torch.sqrt(1.0 + r11[mask] - r00[mask] - r22[mask]) * 2
-    quat[mask, 0] = (r02[mask] - r20[mask]) / s
-    quat[mask, 1] = (r01[mask] + r10[mask]) / s
-    quat[mask, 2] = 0.25 * s
-    quat[mask, 3] = (r12[mask] + r21[mask]) / s
-    
-    # Case 4: else
-    mask = (~mask)
-    s = torch.sqrt(1.0 + r22[mask] - r00[mask] - r11[mask]) * 2
-    quat[mask, 0] = (r10[mask] - r01[mask]) / s
-    quat[mask, 1] = (r02[mask] + r20[mask]) / s
-    quat[mask, 2] = (r12[mask] + r21[mask]) / s
-    quat[mask, 3] = 0.25 * s
+    mask = remaining & (r11 > r22)
+    if mask.any():
+        s = torch.sqrt(1.0 + r11[mask] - r00[mask] - r22[mask]) * 2
+        quat[mask, 0] = (r02[mask] - r20[mask]) / s
+        quat[mask, 1] = (r01[mask] + r10[mask]) / s
+        quat[mask, 2] = 0.25 * s
+        quat[mask, 3] = (r12[mask] + r21[mask]) / s
+        remaining = remaining & (~mask)
+
+    # Case 4: else (remaining entries)
+    mask = remaining
+    if mask.any():
+        s = torch.sqrt(1.0 + r22[mask] - r00[mask] - r11[mask]) * 2
+        quat[mask, 0] = (r10[mask] - r01[mask]) / s
+        quat[mask, 1] = (r02[mask] + r20[mask]) / s
+        quat[mask, 2] = (r12[mask] + r21[mask]) / s
+        quat[mask, 3] = 0.25 * s
     
     if squeeze:
         quat = quat.squeeze(0)

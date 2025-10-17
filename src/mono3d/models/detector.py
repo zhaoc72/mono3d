@@ -208,3 +208,7 @@ class GroundingDINODetector(nn.Module):
 
 
 __all__ = ["GroundingDINODetector"]
+<<<<<<< ours
+=======
+
+>>>>>>> theirs
