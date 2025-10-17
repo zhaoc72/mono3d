@@ -1,34 +1,51 @@
-# configs/model/frontend.yaml
-name: frontend
+# @package _global_
 
-# DINOv3 特征提取器
-dinov3:
-  name: dinov3
-  backbone: vit_base_patch16_224
-  weights: https://dl.fbaipublicfiles.com/dinov3/dinov3_vitb14_pretrain.pth
-  frozen: true                     # 推理时冻结
-  output_layers: [3, 7, 11]        # 多尺度特征
-
-# SAM2 分割器
-sam2:
-  name: sam2
-  model_size: large                # tiny / small / base / large
-  weights: https://dl.fbaipublicfiles.com/segment_anything_2/sam2_hiera_large.pt
-  frozen: true
-  multimask_output: false
-
-# Depth Anything 深度估计
-depth:
-  name: depth_anything
-  encoder: vitl                    # vits / vitb / vitl
-  weights: https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
-  frozen: true
-  max_depth: 10.0                  # 最大深度（米）
-
-# Grounding DINO 检测器（可选）
-detector:
-  enabled: false
-  name: grounding_dino
-  weights: https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
-  text_threshold: 0.25
-  box_threshold: 0.35
+# Frontend model configuration (combines DINOv3, SAM2, Depth)
+model:
+  frontend:
+    # Component selection
+    use_dinov3: true
+    use_sam2: true
+    use_depth: true
+    
+    # DINOv3 settings
+    dinov3:
+      variant: vitb14
+      pretrained: true
+      weights_path: checkpoints/dinov3_vitb14.pth
+      output_dim: 768
+      freeze: false
+    
+    # SAM2 settings
+    sam2:
+      variant: hiera_large
+      pretrained: true
+      weights_path: checkpoints/sam2_hiera_large.pt
+      multimask: false
+    
+    # Depth settings
+    depth:
+      variant: vitl
+      encoder: vitl
+      pretrained: true
+      weights_path: checkpoints/depth_anything_v2_vitl.pth
+      max_depth: 10.0
+    
+    # Feature fusion
+    fusion:
+      method: concat  # concat, add, attention
+      feature_dim: 768
+      output_dim: 256
+      
+      # Fusion network
+      network:
+        hidden_dims: [512, 256]
+        activation: relu
+        dropout: 0.1
+        norm: layer  # layer, batch, instance
+    
+    # Processing order
+    pipeline:
+      - dinov3
+      - sam2
+      - depth

@@ -1,0 +1,81 @@
+# @package _global_
+
+# 3D Gaussian Splatting model configuration
+model:
+  gaussian:
+    # Gaussian parameters
+    num_gaussians: 10000
+    sh_degree: 3  # Spherical harmonics degree (0-3)
+    
+    # Initialization
+    initialization:
+      method: pointcloud  # pointcloud, random, grid
+      scale_init: 0.01
+      opacity_init: 0.1
+      rotation_init: random
+      
+    # Spatial learning rates
+    learning_rates:
+      xyz: 0.00016
+      features_dc: 0.0025
+      features_rest: 0.000125
+      opacity: 0.05
+      scaling: 0.005
+      rotation: 0.001
+      
+    # Densification
+    densification:
+      enabled: true
+      start_iteration: 500
+      end_iteration: 15000
+      interval: 100
+      
+      # Densification criteria
+      grad_threshold: 0.0002
+      size_threshold: 0.01
+      
+      # Densification operations
+      split_large: true
+      clone_small: true
+      
+    # Pruning
+    pruning:
+      enabled: true
+      start_iteration: 3000
+      interval: 100
+      
+      # Pruning criteria
+      opacity_threshold: 0.005
+      size_threshold_max: 10.0
+      
+    # Opacity reset
+    opacity_reset:
+      enabled: true
+      interval: 3000
+      value: 0.01
+      
+    # Rendering
+    rendering:
+      image_height: 256
+      image_width: 256
+      background: white  # white, black, random
+      
+      # Anti-aliasing
+      antialiasing: true
+      
+    # Optimization
+    optimization:
+      iterations: 30000
+      warmup_iterations: 1000
+      
+      # Learning rate scheduling
+      scheduler:
+        type: exponential  # exponential, cosine, step
+        decay_rate: 0.99
+        decay_steps: 1000
+        
+    # Export
+    export:
+      save_ply: true
+      save_mesh: true
+      mesh_resolution: 256

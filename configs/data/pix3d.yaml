@@ -1,52 +1,67 @@
-# configs/data/pix3d.yaml
-name: pix3d
-root: ${paths.data_root}/Pix3D
+# @package _global_
 
-# 数据划分
-split:
-  train: train
-  val: val
-  test: test
-
-# 数据加载
-batch_size: 16
-shuffle: true
-pin_memory: true
-prefetch_factor: 2
-
-# 图像预处理
-image:
-  size: [256, 256]                 # [H, W]
-  normalize:
+# Pix3D dataset configuration
+data:
+  name: pix3d
+  type: Pix3DDataset
+  root: data/Pix3D
+  
+  # Split configuration
+  split:
+    train: train
+    val: val
+    test: test
+  
+  # Categories to use (null for all)
+  categories: null  # ["chair", "table", "sofa", "bed"]
+  
+  # Data loading
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  shuffle: true
+  
+  # Image configuration
+  image:
+    size: [256, 256]  # [height, width]
+    normalize: true
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
-
-# 数据增强
-augmentation:
-  enabled: true
-  random_flip: 0.5
-  color_jitter:
-    brightness: 0.2
-    contrast: 0.2
-    saturation: 0.2
-    hue: 0.1
-  random_crop: true
-
-# 缓存配置
-cache:
-  enabled: true
-  backend: lmdb                    # lmdb / pt / hdf5
-  cache_dir: ${paths.cache_dir}/pix3d
-  features: [dino, depth, mask]    # 需要缓存的特征
-
-# 类别
-categories:
-  - chair
-  - sofa
-  - table
-  - bed
-  - desk
-  - misc
-  - tool
-  - wardrobe
-  - bookcase
+  
+  # Point cloud configuration
+  pointcloud:
+    num_points: 2048
+    normalize: true
+    augment: true
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    random_flip: 0.5
+    random_crop: 0.8
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+    random_rotation: 15  # degrees
+  
+  # Cache configuration
+  cache:
+    enabled: false
+    backend: lmdb  # lmdb or pt
+    features: [dino, depth, mask]
+    recompute: false
+    
+  # Filtering
+  filter:
+    min_points: 100
+    max_occlusion: 0.5
+    truncated: false
+    
+  # Ground truth
+  gt:
+    use_gt_mask: false
+    use_gt_depth: false
+    use_gt_camera: true

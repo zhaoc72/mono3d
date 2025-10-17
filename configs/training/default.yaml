@@ -1,0 +1,64 @@
+# @package _global_
+
+# Default training configuration
+training:
+  # Task selection
+  task: reconstruction  # shape_prior, init_net, reconstruction, full_pipeline
+  
+  # Training parameters
+  epochs: 100
+  start_epoch: 0
+  
+  # Optimizer
+  optimizer:
+    type: adamw  # adam, adamw, sgd
+    lr: 0.0001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
+    
+  # Learning rate scheduler
+  scheduler:
+    type: cosine  # cosine, step, plateau, exponential, none
+    min_lr: 1.0e-06
+    warmup_epochs: 5
+    warmup_start_lr: 1.0e-06
+    
+    # Step scheduler
+    step_size: 30
+    gamma: 0.1
+    
+    # Plateau scheduler
+    patience: 10
+    factor: 0.1
+    
+  # Gradient settings
+  gradient_clip: 1.0
+  accumulation_steps: 1
+  
+  # Validation
+  validation:
+    enabled: true
+    interval: 1  # Validate every N epochs
+    save_visualizations: true
+    num_vis_samples: 5
+    
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 15
+    metric: loss
+    mode: min  # min or max
+    min_delta: 0.0001
+    
+  # Checkpointing
+  checkpoint:
+    save_best: true
+    save_last: true
+    save_interval: 5  # Save every N epochs
+    max_keep: 5  # Keep last N checkpoints
+    
+  # Resume training
+  resume: null  # Path to checkpoint
+  load_optimizer: true
+  load_scheduler: true

@@ -1,0 +1,44 @@
+# @package _global_
+
+# SAM 2 model configuration
+model:
+  sam2:
+    # Model variant
+    variant: hiera_large  # hiera_tiny, hiera_small, hiera_base_plus, hiera_large
+    
+    # Pretrained weights
+    pretrained: true
+    weights_path: checkpoints/sam2_hiera_large.pt
+    
+    # Segmentation configuration
+    segmentation:
+      mode: auto  # auto, point, box, mask
+      multimask: false
+      stability_score_thresh: 0.95
+      pred_iou_thresh: 0.88
+    
+    # Image preprocessing
+    image_size: [1024, 1024]  # SAM2 input size
+    
+    # Point prompts
+    points:
+      num_points: 1
+      strategy: center  # center, grid, random
+      positive: true
+    
+    # Box prompts
+    box:
+      expand_ratio: 1.1
+    
+    # Post-processing
+    post_process:
+      remove_small_regions: true
+      min_area: 100
+      smooth_boundary: true
+      smooth_kernel_size: 5
+    
+    # Video mode (for multi-frame)
+    video:
+      enabled: false
+      propagate: true
+      max_obj_ptrs: 10

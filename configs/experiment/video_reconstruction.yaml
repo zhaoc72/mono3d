@@ -1,0 +1,58 @@
+# @package _global_
+
+# Video reconstruction experiment
+defaults:
+  - override /data: co3dv2
+  - override /model: frontend
+  - override /training: full_pipeline
+  - _self_
+
+# Experiment metadata
+project_name: video_reconstruction
+experiment_name: multiview_v1
+seed: 42
+
+# Data specific
+data:
+  sequence:
+    min_frames: 20
+    max_frames: 50
+    frame_interval: 3
+    
+  multiview:
+    num_views: 8
+    sample_strategy: farthest
+    
+  batch_size: 4
+  num_workers: 8
+  
+  cache:
+    enabled: true
+
+# Model specific
+model:
+  gaussian:
+    num_gaussians: 20000  # More gaussians for multi-view
+    sh_degree: 3
+    
+    densification:
+      start_iteration: 500
+      end_iteration: 20000
+      
+    optimization:
+      iterations: 40000  # More iterations for video
+
+# Training specific
+training:
+  epochs: 60
+  
+  optimizer:
+    lr: 0.00005  # Lower LR for multi-view
+    
+# Loss weights
+loss_weights:
+  color: 1.0
+  depth: 0.1
+  mask: 0.3
+  multiview_consistency: 0.5
+  temporal_smooth: 0.2

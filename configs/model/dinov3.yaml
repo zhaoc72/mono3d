@@ -1,0 +1,33 @@
+# @package _global_
+
+# DINOv3 model configuration
+model:
+  dinov3:
+    # Model variant
+    variant: vitb14  # vits14, vitb14, vitl14, vitg14
+    
+    # Pretrained weights
+    pretrained: true
+    weights_path: checkpoints/dinov3_vitb14.pth
+    
+    # Feature extraction
+    features:
+      layer: last  # last, intermediate
+      num_layers: 1
+      output_dim: 768  # vitb14: 768, vitl14: 1024, vitg14: 1536
+      pooling: cls  # cls, mean, max
+    
+    # Image preprocessing
+    image_size: [518, 518]  # DINOv3 optimal size
+    patch_size: 14
+    
+    # Frozen layers
+    freeze:
+      enabled: false
+      layers: []  # Empty list = freeze all
+    
+    # Feature fusion
+    fusion:
+      enabled: false
+      layers: [3, 6, 9, 11]  # Which layers to fuse
+      method: concat  # concat, add, attention

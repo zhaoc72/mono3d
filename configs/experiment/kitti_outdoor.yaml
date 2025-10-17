@@ -1,0 +1,49 @@
+# @package _global_
+
+# KITTI outdoor reconstruction experiment
+defaults:
+  - override /data: kitti
+  - override /model: frontend
+  - override /training: default
+  - _self_
+
+# Experiment metadata
+project_name: kitti_outdoor
+experiment_name: outdoor_scenes_v1
+seed: 42
+
+# Data specific
+data:
+  batch_size: 4
+  
+  image:
+    size: [384, 1248]
+    
+  depth:
+    max_depth: 80.0  # Outdoor scenes
+    use_lidar: true
+    
+  object:
+    classes: ["Car"]
+
+# Model specific
+model:
+  depth:
+    variant: vitl
+    max_depth: 80.0
+    
+  gaussian:
+    num_gaussians: 30000  # Larger scenes
+    
+    rendering:
+      background: black  # Outdoor typically has sky
+
+# Training
+training:
+  epochs: 50
+  
+# Loss weights
+loss_weights:
+  color: 1.0
+  depth: 0.3  # More weight on depth for outdoor
+  mask: 0.2

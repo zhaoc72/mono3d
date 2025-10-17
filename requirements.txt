@@ -1,0 +1,51 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scipy>=1.10.0
+pillow>=9.5.0
+
+# Configuration
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Data processing
+opencv-python>=4.7.0
+scikit-image>=0.20.0
+pandas>=2.0.0
+
+# Visualization
+matplotlib>=3.7.0
+plotly>=5.14.0
+
+# Deep learning models
+timm>=0.9.0  # For DINOv3
+transformers>=4.30.0  # For vision models
+
+# 3D processing
+trimesh>=3.21.0
+open3d>=0.17.0  # Optional, for advanced 3D visualization
+pymeshlab>=2022.2  # Optional, for mesh processing
+
+# Logging and monitoring
+tensorboard>=2.13.0
+wandb>=0.15.0  # Optional
+
+# Data storage
+lmdb>=1.4.0
+h5py>=3.8.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+einops>=0.6.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.3.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.3.0

@@ -1,30 +1,56 @@
-# configs/model/shape_prior.yaml
-name: shape_prior
+# @package _global_
 
-# 显式先验
-explicit:
-  enabled: true
-  template_dir: ${paths.data_root}/templates
-  representation: mesh             # mesh / voxel / pointcloud
-  alignment:
-    method: icp                    # icp / pca / learned
-    iterations: 50
-
-# 隐式先验 (VAE)
-implicit:
-  enabled: true
-  type: vae                        # vae / gan / diffusion
-  
-  encoder:
-    backbone: pointnet              # pointnet / dgcnn
-    hidden_dims: [256, 512, 512]
-    latent_dim: 128
-  
-  decoder:
-    type: mlp                       # mlp / sdf / occupancy
-    hidden_dims: [512, 512, 256]
-    output_dim: 3                   # xyz for pointcloud
+# Shape prior model configuration
+model:
+  shape_prior:
+    type: implicit  # explicit or implicit
     
-  loss:
-    reconstruction_weight: 1.0
-    kld_weight: 0.001
+    # Explicit shape prior (template-based)
+    explicit:
+      num_templates: 10
+      template_points: 2048
+      deformation:
+        method: mlp
+        hidden_dims: [256, 512, 512, 256]
+        output_dim: 3
+    
+    # Implicit shape prior (VAE/GAN)
+    implicit:
+      # Architecture
+      architecture: vae  # vae, gan, diffusion
+      
+      # Encoder
+      encoder:
+        backbone: pointnet  # pointnet, pointnet++, dgcnn
+        hidden_dims: [64, 128, 256, 512]
+        global_pooling: max
+        
+      # Decoder
+      decoder:
+        type: mlp  # mlp, folding, implicit
+        hidden_dims: [512, 512, 256, 128]
+        output_points: 2048
+        output_dim: 3
+        
+      # Latent space
+      latent_dim: 128
+      
+      # VAE specific
+      vae:
+        beta: 0.001  # KLD weight
+        kld_weight: 0.001
+        
+      # Training
+      training:
+        reconstruction_loss: chamfer  # chamfer, emd
+        use_normal: false
+        
+      # Loss weights
+      loss:
+        reconstruction: 1.0
+        kld: 0.001
+        normal: 0.1
+    
+    # Pretrained weights
+    pretrained: false
+    weights_path: null

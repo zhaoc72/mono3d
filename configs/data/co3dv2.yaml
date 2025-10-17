@@ -1,0 +1,71 @@
+# @package _global_
+
+# CO3Dv2 dataset configuration
+data:
+  name: co3dv2
+  type: CO3Dv2Dataset
+  root: data/CO3Dv2
+  
+  # Split configuration
+  split:
+    train: train
+    val: val
+    test: test
+  
+  # Categories (CO3D has 50 categories)
+  categories: null  # Use all categories, or specify subset
+  
+  # Sequence configuration
+  sequence:
+    min_frames: 10
+    max_frames: 100
+    frame_sampling: uniform  # uniform or random
+    frame_interval: 5  # Sample every N frames
+  
+  # Data loading
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  shuffle: true
+  
+  # Image configuration
+  image:
+    size: [256, 256]
+    normalize: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  
+  # Multi-view configuration
+  multiview:
+    num_views: 5
+    sample_strategy: farthest  # farthest, random, sequential
+    overlap_threshold: 0.3
+  
+  # Point cloud configuration
+  pointcloud:
+    num_points: 4096
+    normalize: true
+    remove_outliers: true
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    random_flip: 0.0  # No flip for multi-view
+    color_jitter:
+      brightness: 0.15
+      contrast: 0.15
+      saturation: 0.15
+      hue: 0.05
+  
+  # Cache
+  cache:
+    enabled: false
+    backend: lmdb
+    features: [dino, depth, mask]
+  
+  # Quality filtering
+  filter:
+    min_quality: 0.5
+    min_views: 3
+    max_occlusion: 0.6

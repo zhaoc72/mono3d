@@ -1,45 +1,54 @@
-# configs/config.yaml
+# Main configuration file for Mono3D
+# This serves as the base config that all experiments inherit from
+
 defaults:
-  - data: pix3d                    # 默认数据集
-  - model: frontend                # 默认模型配置
-  - training: shape_prior          # 默认训练配置
-  - _self_                         # 确保当前配置最后覆盖
+  - data: pix3d
+  - model: frontend
+  - training: default
+  - _self_
 
-# 全局设置
+# Project metadata
 project_name: mono3d_reconstruction
+experiment_name: default
 seed: 42
-device: cuda                       # cuda / cpu / auto
-num_workers: 8                     # 数据加载线程数
 
-# 路径配置
-paths:
-  data_root: ${oc.env:DATA_ROOT,./data}
-  output_dir: ${oc.env:OUTPUT_DIR,./outputs}
-  cache_dir: ${oc.env:MONO3D_CACHE,~/.cache/mono3d}
-  checkpoint_dir: ${paths.output_dir}/checkpoints
-  log_dir: ${paths.output_dir}/logs
-
-# 分布式训练
+# Device configuration
+device: cuda  # cuda or cpu
 distributed:
   enabled: false
   backend: nccl
   world_size: 1
   rank: 0
 
-# 日志与监控
-logging:
-  use_wandb: false
-  wandb_project: ${project_name}
-  log_interval: 10                 # 每N步打印一次
-  save_interval: 500               # 每N步保存检查点
-
-# 混合精度
+# Mixed precision training
 amp:
   enabled: true
-  dtype: bfloat16                  # bfloat16 / float16
+  opt_level: O1
 
-# 推理设置
-inference:
-  batch_size: 1
-  export_format: ply               # ply / obj / both
-  visualize: true
+# Paths
+paths:
+  data_dir: data
+  output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  checkpoint_dir: ${paths.output_dir}/checkpoints
+  log_dir: ${paths.output_dir}/logs
+  cache_dir: ${paths.data_dir}/cache
+
+# Logging configuration
+logging:
+  level: INFO
+  save_interval: 5  # Save checkpoint every N epochs
+  log_interval: 10  # Log metrics every N iterations
+  use_wandb: false
+  wandb_project: mono3d
+  wandb_entity: null
+  use_tensorboard: true
+
+# Hydra configuration
+hydra:
+  run:
+    dir: ${paths.output_dir}
+  sweep:
+    dir: outputs/sweeps/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: true

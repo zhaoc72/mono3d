@@ -1,0 +1,42 @@
+# @package _global_
+
+# Depth Anything model configuration
+model:
+  depth:
+    # Model variant
+    variant: vitl  # vits, vitb, vitl
+    encoder: vitl  # Encoder backbone
+    
+    # Pretrained weights
+    pretrained: true
+    weights_path: checkpoints/depth_anything_v2_vitl.pth
+    
+    # Version
+    version: v2  # v1 or v2
+    
+    # Depth estimation
+    estimation:
+      max_depth: 10.0  # Metric depth scale
+      min_depth: 0.1
+      output_scale: metric  # metric or relative
+    
+    # Image preprocessing
+    image_size: [518, 518]
+    
+    # Inference
+    inference:
+      mode: global  # global or patches
+      patch_size: 518
+      overlap: 0.1  # For patch mode
+    
+    # Post-processing
+    post_process:
+      median_filter: false
+      bilateral_filter: false
+      hole_filling: true
+    
+    # Fine-tuning
+    finetune:
+      enabled: false
+      freeze_encoder: true
+      decoder_lr_multiplier: 10.0

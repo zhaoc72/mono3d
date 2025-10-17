@@ -1,0 +1,53 @@
+# @package _global_
+
+# Shape initialization network configuration
+model:
+  initializer:
+    type: shapeinitnet  # shapeinitnet, pointnet, custom
+    
+    # Input
+    input:
+      features: [dino, depth, mask]
+      feature_dim: 768
+      use_camera: true
+      
+    # Architecture
+    architecture:
+      # Feature encoder
+      encoder:
+        type: transformer  # mlp, transformer, attention
+        hidden_dims: [512, 512, 256]
+        num_layers: 6
+        num_heads: 8
+        dropout: 0.1
+        
+      # Shape decoder
+      decoder:
+        type: mlp
+        hidden_dims: [256, 512, 1024]
+        output_points: 2048
+        output_dim: 3
+        
+      # Additional outputs
+      predict_normals: false
+      predict_colors: false
+      
+    # Shape prior integration
+    use_shape_prior: true
+    shape_prior_weight: 0.1
+    
+    # Camera integration
+    camera:
+      use_intrinsics: true
+      use_extrinsics: false
+      embedding_dim: 64
+      
+    # Training
+    training:
+      loss: chamfer  # chamfer, emd, l2
+      use_symmetry: false
+      symmetry_plane: y
+      
+    # Pretrained weights
+    pretrained: false
+    weights_path: null

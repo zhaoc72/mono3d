@@ -1,0 +1,71 @@
+# @package _global_
+
+# Virtual KITTI 2 dataset configuration
+data:
+  name: virtual_kitti
+  type: VirtualKITTIDataset
+  root: data/vKITTI2
+  
+  # Split configuration
+  split:
+    train: train
+    val: val
+    test: test
+  
+  # Scene selection
+  scenes: null  # Use all scenes: Scene01-Scene06
+  
+  # Variants (lighting/weather conditions)
+  variants: [clone, morning, overcast, fog, rain, sunset]
+  
+  # Camera selection
+  cameras: [0, 1]  # 0: left, 1: right
+  
+  # Data loading
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  shuffle: true
+  
+  # Image configuration
+  image:
+    size: [384, 1248]
+    normalize: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  
+  # Perfect ground truth availability
+  gt:
+    use_perfect_depth: true
+    use_perfect_segmentation: true
+    use_optical_flow: false
+  
+  # Depth configuration
+  depth:
+    max_depth: 80.0
+    use_16bit: true  # Virtual KITTI provides 16-bit depth
+  
+  # Point cloud
+  pointcloud:
+    num_points: 4096
+    use_semantic_labels: true
+  
+  # Object tracking
+  tracking:
+    enabled: false
+    min_track_length: 5
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    random_flip: 0.5
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+  
+  # Cache
+  cache:
+    enabled: false
+    backend: pt
+    features: [dino, depth, mask]

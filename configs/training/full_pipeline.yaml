@@ -1,0 +1,76 @@
+# @package _global_
+
+# Pix3D reconstruction experiment
+defaults:
+  - override /data: pix3d
+  - override /model: frontend
+  - override /training: full_pipeline
+  - _self_
+
+# Experiment metadata
+project_name: pix3d_reconstruction
+experiment_name: full_pipeline_v1
+seed: 42
+
+# Data specific
+data:
+  categories: ["chair", "table", "sofa"]
+  batch_size: 8
+  num_workers: 4
+  
+  cache:
+    enabled: true
+    features: [dino, depth, mask]
+
+# Model specific
+model:
+  # Frontend
+  dinov3:
+    variant: vitb14
+    freeze: false
+    
+  sam2:
+    variant: hiera_base_plus
+    
+  depth:
+    variant: vitb
+    max_depth: 5.0  # Indoor scenes
+    
+  # Gaussian
+  gaussian:
+    num_gaussians: 10000
+    sh_degree: 3
+    optimization:
+      iterations: 20000
+      
+  # Shape prior
+  shape_prior:
+    implicit:
+      latent_dim: 128
+      loss:
+        kld: 0.001
+
+# Training specific
+training:
+  epochs: 80
+  
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.0001
+    
+  validation:
+    interval: 2
+    
+# Loss weights
+loss_weights:
+  color: 1.0
+  depth: 0.2
+  mask: 0.5
+  shape_prior: 0.01
+  normal_smooth: 0.05
+  
+# Logging
+logging:
+  use_wandb: true
+  wandb_project: pix3d_reconstruction
+  log_interval: 20
