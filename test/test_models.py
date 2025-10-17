@@ -33,10 +33,6 @@ class TestNetworks:
 
         assert output.shape == (4, 128)
 
-<<<<<<< ours
-=======
-
->>>>>>> theirs
 class TestDetector:
     """Tests for the Grounding DINO detector wrapper."""
 

@@ -15,30 +15,58 @@ log = logging.getLogger(__name__)
 
 
 WEIGHTS = {
-    'dinov3': {
+    # DINOv3 (fallback URLs point to DINOv2 weights; rename upon download)
+    'dinov3_vits16': {
+        'url': 'https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth',
+        'filename': 'dinov3_vits16_pretrain_lvd1689m-08c60483.pth',
+        'size_mb': 270,
+    },
+    'dinov3_vits16plus': {
+        'url': 'https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth',
+        'filename': 'dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth',
+        'size_mb': 270,
+    },
+    'dinov3_vitb14': {
         'url': 'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth',
-        'filename': 'dinov3_vitb14.pth',
+        'filename': 'dinov3_vitb14_pretrain.pth',
         'size_mb': 330,
     },
+    # SAM2.1 variants
+    'sam2_tiny': {
+        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt',
+        'filename': 'sam2.1_hiera_tiny.pt',
+        'size_mb': 180,
+    },
+    'sam2_small': {
+        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt',
+        'filename': 'sam2.1_hiera_small.pt',
+        'size_mb': 240,
+    },
+    'sam2_base_plus': {
+        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt',
+        'filename': 'sam2.1_hiera_base_plus.pt',
+        'size_mb': 320,
+    },
     'sam2_large': {
-        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt',
-        'filename': 'sam2_hiera_large.pt',
-        'size_mb': 850,
+        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt',
+        'filename': 'sam2.1_hiera_large.pt',
+        'size_mb': 870,
     },
-    'sam2_base': {
-        'url': 'https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt',
-        'filename': 'sam2_hiera_base_plus.pt',
-        'size_mb': 310,
-    },
-    'depth_anything_vitl': {
-        'url': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth',
-        'filename': 'depth_anything_v2_vitl.pth',
-        'size_mb': 1300,
+    # Depth Anything V2 variants
+    'depth_anything_vits': {
+        'url': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth',
+        'filename': 'depth_anything_v2_vits.pth',
+        'size_mb': 270,
     },
     'depth_anything_vitb': {
         'url': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth',
         'filename': 'depth_anything_v2_vitb.pth',
-        'size_mb': 400,
+        'size_mb': 430,
+    },
+    'depth_anything_vitl': {
+        'url': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth',
+        'filename': 'depth_anything_v2_vitl.pth',
+        'size_mb': 1320,
     },
 }
 
@@ -75,7 +103,7 @@ def main():
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='checkpoints',
+        default='checkpoints/pretrained',
         help='Output directory for weights'
     )
     parser.add_argument(

@@ -426,10 +426,6 @@ class GaussianModel(nn.Module):
 
         self.num_gaussians = self._xyz.shape[0]
 
-<<<<<<< ours
-
-=======
->>>>>>> theirs
     def optimize(
         self,
         images: torch.Tensor,
