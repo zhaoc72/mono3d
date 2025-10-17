@@ -1,16 +1,104 @@
-"""前端模型：DINOv3, SAM2, Depth Anything
+"""封装视觉前端模型组件。
 
-封装预训练的视觉基础模型用于特征提取、分割和深度估计。
+本模块聚合了 DINOv3、SAM2 和 Depth Anything V2 等基础模型。
+在离线环境下我们会优先从 ``checkpoints/pretrained`` 目录加载
+用户提供的检查点文件，并在缺失依赖或权重时提供退化实现，
+以保证单元测试和最小化 demo 能够正常运行。
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List, Iterable
+
+import logging
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from pathlib import Path
-import logging
+import torch.nn.functional as F
+
 
 log = logging.getLogger(__name__)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+CHECKPOINT_SEARCH_PATHS: List[Path] = [
+    PROJECT_ROOT / "checkpoints" / "pretrained",
+    PROJECT_ROOT / "checkpoints",
+    PROJECT_ROOT,
+]
+
+
+def _resolve_checkpoint(explicit: Optional[str], candidates: Iterable[str]) -> Optional[Path]:
+    """Resolve a checkpoint path from explicit or candidate filenames.
+
+    Args:
+        explicit: User-specified path (absolute or relative).
+        candidates: Candidate filenames to probe under the default search paths.
+
+    Returns:
+        A resolved :class:`Path` if the file exists, otherwise ``None``.
+    """
+
+    def _probe(path: Path) -> Optional[Path]:
+        if path.is_file():
+            return path
+        return None
+
+    if explicit:
+        explicit_path = Path(explicit)
+        if not explicit_path.is_absolute():
+            for base in CHECKPOINT_SEARCH_PATHS:
+                resolved = _probe(base / explicit_path)
+                if resolved:
+                    return resolved
+        else:
+            resolved = _probe(explicit_path)
+            if resolved:
+                return resolved
+
+    for candidate in candidates:
+        for base in CHECKPOINT_SEARCH_PATHS:
+            resolved = _probe(base / candidate)
+            if resolved:
+                log.debug("Resolved checkpoint %s", resolved)
+                return resolved
+
+    return None
+
+
+@dataclass(frozen=True)
+class _DINOv3Config:
+    alias: str
+    checkpoint_names: List[str]
+
+
+_DINOV3_VARIANTS: Dict[str, _DINOv3Config] = {
+    "vits16": _DINOv3Config(
+        alias="vit_small_patch16_224",
+        checkpoint_names=["dinov3_vits16_pretrain_lvd1689m-08c60483.pth"],
+    ),
+    "vits16plus": _DINOv3Config(
+        alias="vit_small_patch16_224",
+        checkpoint_names=["dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"],
+    ),
+    "vitb14": _DINOv3Config(
+        alias="vit_base_patch14_224",
+        checkpoint_names=[
+            "dinov3_vitb14_pretrain.pth",
+            "dinov2_vitb14_pretrain.pth",
+        ],
+    ),
+    "default": _DINOv3Config(
+        alias="vit_base_patch16_224",
+        checkpoint_names=[
+            "dinov3_vitb16_pretrain.pth",
+            "dinov2_vitb14_pretrain.pth",
+        ],
+    ),
+}
 
 
 class DINOv3(nn.Module):
@@ -40,7 +128,7 @@ class DINOv3(nn.Module):
         self.backbone_name = backbone
         self.frozen = frozen
         self.output_layers = output_layers or [3, 7, 11]
-        
+
         # 加载模型
         self._load_model(weights)
         
@@ -53,26 +141,75 @@ class DINOv3(nn.Module):
     
     def _load_model(self, weights: Optional[str]):
         """加载DINOv3模型"""
+        resolved_variant = _DINOV3_VARIANTS.get(
+            self.backbone_name.lower(), _DINOV3_VARIANTS["default"]
+        )
+
+        checkpoint = _resolve_checkpoint(weights, resolved_variant.checkpoint_names)
+
         try:
-            # 尝试使用torch.hub
-            self.model = torch.hub.load(
-                'facebookresearch/dinov2',
-                self.backbone_name,
-                pretrained=True if weights is None else False
-            )
-            
-            # 如果提供了自定义权重
-            if weights is not None:
-                state_dict = torch.load(weights, map_location='cpu')
-                self.model.load_state_dict(state_dict)
-                log.info(f"Loaded custom weights from {weights}")
-        
+            # 优先尝试使用 timm 创建 ViT 结构
+            try:
+                import timm
+
+                self.model = timm.create_model(
+                    resolved_variant.alias,
+                    pretrained=False,
+                    features_only=True,
+                    out_indices=self.output_layers,
+                )
+            except Exception:
+                # 回退到 torch hub (可能需要网络)
+                self.model = torch.hub.load(
+                    'facebookresearch/dinov2',
+                    resolved_variant.alias,
+                    pretrained=False,
+                )
+
+            if checkpoint:
+                state_dict = torch.load(checkpoint, map_location='cpu')
+                missing = self.model.load_state_dict(state_dict, strict=False)
+                if isinstance(missing, tuple):
+                    missing = missing[0] or missing[1]
+                log.info(
+                    "Loaded DINOv3 weights from %s (strict=%s)",
+                    checkpoint,
+                    not bool(missing),
+                )
+            elif weights:
+                log.warning("Specified DINOv3 weights not found: %s", weights)
+
         except Exception as e:
-            log.error(f"Failed to load DINOv3: {e}")
-            # 回退方案：创建一个简单的特征提取器
-            log.warning("Using fallback feature extractor")
+            log.error("Failed to initialise DINOv3 backbone: %s", e)
+            log.warning("Using fallback feature extractor instead of ViT")
             self.model = self._create_fallback_model()
-    
+
+    def _prepare_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Resize input tensor to match backbone expectations if required."""
+
+        target_hw: Optional[List[int]] = None
+
+        default_cfg = getattr(self.model, 'default_cfg', None)
+        if isinstance(default_cfg, dict):
+            input_size = default_cfg.get('input_size')
+            if input_size and len(input_size) >= 2:
+                target_hw = [int(input_size[-2]), int(input_size[-1])]
+
+        if target_hw is None and hasattr(self.model, 'img_size'):
+            img_size = getattr(self.model, 'img_size')
+            if isinstance(img_size, (list, tuple)):
+                if len(img_size) == 2:
+                    target_hw = [int(img_size[0]), int(img_size[1])]
+                elif len(img_size) == 1:
+                    target_hw = [int(img_size[0]), int(img_size[0])]
+            elif isinstance(img_size, int):
+                target_hw = [img_size, img_size]
+
+        if target_hw and (x.shape[2], x.shape[3]) != tuple(target_hw):
+            return F.interpolate(x, size=tuple(target_hw), mode='bilinear', align_corners=False)
+
+        return x
+
     def _create_fallback_model(self):
         """创建回退模型（简化的CNN）"""
         import torchvision.models as models
@@ -103,28 +240,38 @@ class DINOv3(nn.Module):
     
     def _forward_impl(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """实际的前向传播实现"""
+        x_prepared = self._prepare_input(x)
         features = {}
-        
+
         # 如果是DINOv2模型
         if hasattr(self.model, 'get_intermediate_layers'):
             # 获取多层特征
             intermediate = self.model.get_intermediate_layers(
-                x,
+                x_prepared,
                 n=self.output_layers,
                 return_class_token=True
             )
-            
+
             for i, (layer_idx, feat) in enumerate(zip(self.output_layers, intermediate)):
                 features[f'layer_{layer_idx}'] = feat
-            
+
             # 最后一层作为全局特征
             features['global'] = intermediate[-1]
-        
+
+        elif isinstance(self.model, nn.Module):
+            output = self.model(x_prepared)
+            if isinstance(output, (list, tuple)):
+                for idx, feat in zip(self.output_layers, output):
+                    features[f'layer_{idx}'] = feat
+                features['global'] = output[-1]
+            else:
+                features['global'] = output
+
         else:
             # 回退模型
-            feat = self.model(x)
+            feat = self.model(x_prepared)
             features['global'] = feat
-        
+
         return features
     
     def extract_patch_features(
@@ -143,6 +290,20 @@ class DINOv3(nn.Module):
         """
         features = self.forward(x)
         return features[f'layer_{layer}']
+
+
+@dataclass(frozen=True)
+class _SAM2Config:
+    config_file: str
+    checkpoint_names: List[str]
+
+
+_SAM2_VARIANTS: Dict[str, _SAM2Config] = {
+    "tiny": _SAM2Config("sam2.1_hiera_t.yaml", ["sam2.1_hiera_tiny.pt"]),
+    "small": _SAM2Config("sam2.1_hiera_s.yaml", ["sam2.1_hiera_small.pt"]),
+    "base": _SAM2Config("sam2.1_hiera_b+.yaml", ["sam2.1_hiera_base_plus.pt"]),
+    "large": _SAM2Config("sam2.1_hiera_l.yaml", ["sam2.1_hiera_large.pt"]),
+}
 
 
 class SAM2(nn.Module):
@@ -185,33 +346,25 @@ class SAM2(nn.Module):
     
     def _load_model(self, weights: Optional[str]):
         """加载SAM2模型"""
+        resolved_variant = _SAM2_VARIANTS.get(
+            self.model_size.lower(), _SAM2_VARIANTS["large"]
+        )
+
+        checkpoint = _resolve_checkpoint(weights, resolved_variant.checkpoint_names)
+
         try:
-            # 尝试导入SAM2库
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-            
-            # 模型配置文件
-            config_map = {
-                'tiny': 'sam2_hiera_t.yaml',
-                'small': 'sam2_hiera_s.yaml',
-                'base': 'sam2_hiera_b+.yaml',
-                'large': 'sam2_hiera_l.yaml',
-            }
-            
-            config_file = config_map.get(self.model_size, 'sam2_hiera_l.yaml')
-            
-            # 构建模型
-            if weights is None:
-                # 使用默认权重
-                checkpoint = f"checkpoints/{config_file.replace('.yaml', '.pt')}"
-            else:
-                checkpoint = weights
-            
-            sam2_model = build_sam2(config_file, checkpoint)
+
+            if checkpoint is None and weights:
+                log.warning("SAM2 weights not found at %s", weights)
+
+            sam2_model = build_sam2(resolved_variant.config_file, checkpoint)
             self.predictor = SAM2ImagePredictor(sam2_model)
-            
-            log.info(f"Loaded SAM2 from {checkpoint}")
-        
+
+            if checkpoint:
+                log.info("Loaded SAM2 checkpoint from %s", checkpoint)
+
         except Exception as e:
             log.error(f"Failed to load SAM2: {e}")
             log.warning("SAM2 not available, using placeholder")
@@ -308,12 +461,34 @@ class SAM2(nn.Module):
         return mask.squeeze()
 
 
-class DepthAnything(nn.Module):
-    """Depth Anything深度估计模型
-    
+@dataclass(frozen=True)
+class _DepthAnythingConfig:
+    repo_id: str
+    checkpoint_names: List[str]
+
+
+_DEPTH_VARIANTS: Dict[str, _DepthAnythingConfig] = {
+    "vits": _DepthAnythingConfig(
+        repo_id="depth-anything/Depth-Anything-V2-Small",
+        checkpoint_names=["depth_anything_v2_vits.pth"],
+    ),
+    "vitb": _DepthAnythingConfig(
+        repo_id="depth-anything/Depth-Anything-V2-Base",
+        checkpoint_names=["depth_anything_v2_vitb.pth"],
+    ),
+    "vitl": _DepthAnythingConfig(
+        repo_id="depth-anything/Depth-Anything-V2-Large",
+        checkpoint_names=["depth_anything_v2_vitl.pth"],
+    ),
+}
+
+
+class DepthAnythingV2(nn.Module):
+    """Depth Anything V2 深度估计模型
+
     论文: https://arxiv.org/abs/2401.10891
     """
-    
+
     def __init__(
         self,
         encoder: str = 'vitl',
@@ -322,55 +497,49 @@ class DepthAnything(nn.Module):
         max_depth: float = 10.0,
         **kwargs
     ):
-        """初始化Depth Anything
-        
-        Args:
-            encoder: 编码器大小 (vits/vitb/vitl)
-            weights: 预训练权重路径
-            frozen: 是否冻结
-            max_depth: 最大深度值（米）
-        """
         super().__init__()
-        
+
         self.encoder_name = encoder
         self.frozen = frozen
         self.max_depth = max_depth
-        
-        # 加载模型
+
         self._load_model(weights)
-        
+
         if frozen:
             self.eval()
             for param in self.parameters():
                 param.requires_grad = False
-        
-        log.info(f"Initialized Depth Anything ({encoder}), frozen={frozen}")
-    
+
+        log.info(f"Initialized Depth Anything V2 ({encoder}), frozen={frozen}")
+
     def _load_model(self, weights: Optional[str]):
-        """加载Depth Anything模型"""
+        resolved_variant = _DEPTH_VARIANTS.get(
+            self.encoder_name.lower(), _DEPTH_VARIANTS["vitl"]
+        )
+
+        checkpoint = _resolve_checkpoint(weights, resolved_variant.checkpoint_names)
+
         try:
-            # 尝试导入Depth Anything
-            from depth_anything.dpt import DepthAnything as DepthAnythingModel
-            
-            encoder_map = {
-                'vits': 'vits',
-                'vitb': 'vitb',
-                'vitl': 'vitl',
-            }
-            
-            encoder = encoder_map.get(self.encoder_name, 'vitl')
-            
-            self.model = DepthAnythingModel.from_pretrained(
-                f'LiheYoung/depth_anything_{encoder}14'
-            )
-            
-            if weights is not None:
-                state_dict = torch.load(weights, map_location='cpu')
-                self.model.load_state_dict(state_dict)
-                log.info(f"Loaded custom weights from {weights}")
-        
+            try:
+                from depth_anything_v2 import DepthAnythingV2 as DepthAnythingModel
+            except ImportError:
+                from depth_anything.dpt import DepthAnything as DepthAnythingModel  # type: ignore
+
+            self.model = DepthAnythingModel.from_pretrained(resolved_variant.repo_id)
+
+            if checkpoint:
+                state_dict = torch.load(checkpoint, map_location='cpu')
+                missing = self.model.load_state_dict(state_dict, strict=False)
+                log.info(
+                    "Loaded Depth Anything V2 weights from %s (strict=%s)",
+                    checkpoint,
+                    not bool(missing),
+                )
+            elif weights:
+                log.warning("Depth Anything V2 weights not found at %s", weights)
+
         except Exception as e:
-            log.error(f"Failed to load Depth Anything: {e}")
+            log.error(f"Failed to load Depth Anything V2: {e}")
             log.warning("Using fallback depth estimator")
             self.model = self._create_fallback_model()
     
@@ -455,7 +624,7 @@ class FrontendModel(nn.Module):
         
         self.dino = DINOv3(**dinov3_cfg)
         self.sam = SAM2(**sam2_cfg)
-        self.depth = DepthAnything(**depth_cfg)
+        self.depth = DepthAnythingV2(**depth_cfg)
         
         log.info("Initialized Frontend Model")
     

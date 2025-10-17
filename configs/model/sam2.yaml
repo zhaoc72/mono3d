@@ -8,7 +8,7 @@ model:
     
     # Pretrained weights
     pretrained: true
-    weights_path: checkpoints/sam2_hiera_large.pt
+    weights_path: checkpoints/pretrained/sam2.1_hiera_large.pt
     
     # Segmentation configuration
     segmentation:

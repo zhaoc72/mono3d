@@ -12,7 +12,7 @@ model:
     dinov3:
       variant: vitb14
       pretrained: true
-      weights_path: checkpoints/dinov3_vitb14.pth
+      weights_path: checkpoints/pretrained/dinov3_vitb14_pretrain.pth
       output_dim: 768
       freeze: false
     
@@ -20,7 +20,7 @@ model:
     sam2:
       variant: hiera_large
       pretrained: true
-      weights_path: checkpoints/sam2_hiera_large.pt
+      weights_path: checkpoints/pretrained/sam2.1_hiera_large.pt
       multimask: false
     
     # Depth settings
@@ -28,7 +28,7 @@ model:
       variant: vitl
       encoder: vitl
       pretrained: true
-      weights_path: checkpoints/depth_anything_v2_vitl.pth
+      weights_path: checkpoints/pretrained/depth_anything_v2_vitl.pth
       max_depth: 10.0
     
     # Feature fusion

@@ -7,7 +7,10 @@
 - 初始化网络
 """
 
-from .frontend import DINOv3, SAM2, DepthAnything
+from .frontend import DINOv3, SAM2, DepthAnythingV2
+
+# 向后兼容的别名
+DepthAnything = DepthAnythingV2
 from .detector import GroundingDINODetector
 from .shape_prior import ExplicitShapePrior, ImplicitShapePrior, ShapeVAE
 from .gaussian import GaussianModel, GaussianRenderer
@@ -28,7 +31,7 @@ from ..registry import register
 # 注册前端模型
 register('model', 'dinov3')(DINOv3)
 register('model', 'sam2')(SAM2)
-register('model', 'depth_anything')(DepthAnything)
+register('model', 'depth_anything')(DepthAnythingV2)
 register('model', 'grounding_dino')(GroundingDINODetector)
 
 # 注册形状先验
@@ -46,6 +49,7 @@ __all__ = [
     # Frontend
     'DINOv3',
     'SAM2',
+    'DepthAnythingV2',
     'DepthAnything',
     'GroundingDINODetector',
     # Shape Prior
