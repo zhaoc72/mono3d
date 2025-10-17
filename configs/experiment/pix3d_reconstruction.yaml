@@ -1,0 +1,44 @@
+# @package _global_
+
+# 组合配置实现完整实验
+defaults:
+  - override /data: pix3d
+  - override /model: frontend
+  - override /model/shape_prior: shape_prior
+  - override /training: full_pipeline
+
+# 实验特定覆盖
+project_name: pix3d_full_reconstruction
+seed: 2024
+
+# 训练覆盖
+training:
+  epochs: 50
+  optimizer:
+    lr: 5.0e-5
+
+# 3DGS特定配置
+gaussian:
+  num_gaussians: 10000
+  sh_degree: 3
+  optimization:
+    iterations: 3000
+    position_lr: 1.6e-4
+    scale_lr: 5.0e-3
+    rotation_lr: 1.0e-3
+    opacity_lr: 5.0e-2
+    color_lr: 2.5e-3
+
+# 损失权重
+loss_weights:
+  color: 1.0
+  depth: 0.1
+  mask: 0.5
+  shape_prior: 0.01
+  normal_smooth: 0.05
+
+# 输出
+output:
+  save_mesh: true
+  save_pointcloud: true
+  render_views: 8                  # 渲染N个视角

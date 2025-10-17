@@ -1,0 +1,33 @@
+# configs/training/shape_prior.yaml
+name: train_shape_prior
+task: shape_prior                  # shape_prior / init_net / reconstruction
+
+# 优化器
+optimizer:
+  type: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+# 学习率调度
+scheduler:
+  type: cosine                     # cosine / step / plateau
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+# 训练设置
+epochs: 100
+gradient_clip: 1.0
+accumulation_steps: 1              # 梯度累积
+
+# 验证
+validation:
+  interval: 1                      # 每N个epoch验证
+  metrics: [chamfer, iou, fscore]
+
+# 早停
+early_stopping:
+  enabled: true
+  patience: 10
+  metric: chamfer
+  mode: min

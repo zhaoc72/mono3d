@@ -1,0 +1,45 @@
+# configs/config.yaml
+defaults:
+  - data: pix3d                    # 默认数据集
+  - model: frontend                # 默认模型配置
+  - training: shape_prior          # 默认训练配置
+  - _self_                         # 确保当前配置最后覆盖
+
+# 全局设置
+project_name: mono3d_reconstruction
+seed: 42
+device: cuda                       # cuda / cpu / auto
+num_workers: 8                     # 数据加载线程数
+
+# 路径配置
+paths:
+  data_root: ${oc.env:DATA_ROOT,./data}
+  output_dir: ${oc.env:OUTPUT_DIR,./outputs}
+  cache_dir: ${oc.env:MONO3D_CACHE,~/.cache/mono3d}
+  checkpoint_dir: ${paths.output_dir}/checkpoints
+  log_dir: ${paths.output_dir}/logs
+
+# 分布式训练
+distributed:
+  enabled: false
+  backend: nccl
+  world_size: 1
+  rank: 0
+
+# 日志与监控
+logging:
+  use_wandb: false
+  wandb_project: ${project_name}
+  log_interval: 10                 # 每N步打印一次
+  save_interval: 500               # 每N步保存检查点
+
+# 混合精度
+amp:
+  enabled: true
+  dtype: bfloat16                  # bfloat16 / float16
+
+# 推理设置
+inference:
+  batch_size: 1
+  export_format: ply               # ply / obj / both
+  visualize: true

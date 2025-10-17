@@ -1,0 +1,30 @@
+# configs/model/shape_prior.yaml
+name: shape_prior
+
+# 显式先验
+explicit:
+  enabled: true
+  template_dir: ${paths.data_root}/templates
+  representation: mesh             # mesh / voxel / pointcloud
+  alignment:
+    method: icp                    # icp / pca / learned
+    iterations: 50
+
+# 隐式先验 (VAE)
+implicit:
+  enabled: true
+  type: vae                        # vae / gan / diffusion
+  
+  encoder:
+    backbone: pointnet              # pointnet / dgcnn
+    hidden_dims: [256, 512, 512]
+    latent_dim: 128
+  
+  decoder:
+    type: mlp                       # mlp / sdf / occupancy
+    hidden_dims: [512, 512, 256]
+    output_dim: 3                   # xyz for pointcloud
+    
+  loss:
+    reconstruction_weight: 1.0
+    kld_weight: 0.001
