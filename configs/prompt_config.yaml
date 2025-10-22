@@ -9,4 +9,4 @@ points:
   positive_points_per_box: 1
   negative_points_per_box: 1
   negative_offset: 5
-  strategy: "peak"
+  point_strategy: "peak"

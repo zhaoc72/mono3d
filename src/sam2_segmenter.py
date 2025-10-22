@@ -46,7 +46,7 @@ class SAM2Segmenter:
         if not self.config.checkpoint_path or not self.config.model_config:
             raise ValueError("SAM2 official backend requires checkpoint_path and model_config")
         try:
-            from sam2.build_sam2 import build_sam2
+            from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
         except ImportError as exc:
             raise ImportError(
