@@ -1,0 +1,6 @@
+opencv-python
+numpy
+PyYAML
+torch
+transformers
+torchvision

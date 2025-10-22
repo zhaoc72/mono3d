@@ -1,0 +1,12 @@
+attention:
+  normalize: true
+  smoothing_kernel: 5
+  threshold_strategy: "percentile"
+  percentile: 85
+  min_component_area: 2000
+  max_components: 10
+points:
+  positive_points_per_box: 1
+  negative_points_per_box: 1
+  negative_offset: 5
+  strategy: "peak"
