@@ -18,9 +18,9 @@ sam2:
   max_batch_size: 32
 pipeline:
   input_size: null
-  heat_threshold: 0.3
+  heat_threshold: 0.8
   min_box_area: 200
-  area_threshold: 300
+  area_threshold: 100
   kernel_size: 7
   dilation_radius: 5
   
@@ -33,7 +33,7 @@ pipeline:
     num_clusters: 6
     max_iterations: 30
     random_state: 0
-    min_region_area: 800
+    min_region_area: 400
     max_regions: 5
   prompt:
     include_boxes: true

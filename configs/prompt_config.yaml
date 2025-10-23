@@ -1,9 +1,9 @@
 attention:
   normalize: true
-  smoothing_kernel: 10
+  smoothing_kernel: 5
   threshold_strategy: "percentile"
-  percentile: 65
-  min_component_area: 4000
+  percentile: 80
+  min_component_area: 1000
   max_components: 10
 points:
   positive_points_per_box: 3
