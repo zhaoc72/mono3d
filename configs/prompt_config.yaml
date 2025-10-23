@@ -3,10 +3,10 @@ attention:
   smoothing_kernel: 5
   threshold_strategy: "percentile"
   percentile: 85
-  min_component_area: 2000
+  min_component_area: 1000
   max_components: 10
 points:
-  positive_points_per_box: 1
-  negative_points_per_box: 1
-  negative_offset: 5
-  point_strategy: "peak"
+  positive_points_per_box: 3
+  negative_points_per_box: 2
+  negative_offset: 10
+  point_strategy: "distributed"

@@ -18,11 +18,12 @@ sam2:
   max_batch_size: 32
 pipeline:
   input_size: null
-  heat_threshold: 0.5
-  min_box_area: 1000
-  area_threshold: 1000
-  kernel_size: 5
-  dilation_radius: 3
+  heat_threshold: 0.3
+  min_box_area: 200
+  area_threshold: 300
+  kernel_size: 7
+  dilation_radius: 5
+  
   frame_skip: 1
   max_prompts_per_batch: 32
   output_mask_format: "png"
