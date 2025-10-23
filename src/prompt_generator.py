@@ -1,117 +1,141 @@
-"""Prompt generation utilities from DINOv3 attention maps."""
+"""Convert clustered DINOv3 features into SAM2 friendly prompts."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
-import cv2
 import numpy as np
+from PIL import Image
+
+
+@dataclass
+class ClusterConfig:
+    """Configuration controlling unsupervised clustering of patch embeddings."""
+
+    num_clusters: int = 6
+    max_iterations: int = 30
+    random_state: int = 0
+    min_region_area: int = 800
+    max_regions: int = 5
 
 
 @dataclass
 class PromptConfig:
-    normalize: bool = True
-    threshold_strategy: str = "percentile"
-    threshold: float = 0.5
-    percentile: float = 85.0
-    smoothing_kernel: int = 5
-    min_component_area: int = 2000
-    max_components: int = 5
-    positive_points_per_box: int = 1
-    negative_points_per_box: int = 1
-    negative_offset: int = 5
-    point_strategy: str = "peak"
+    """Configuration for converting regions into SAM2 prompts."""
+
+    include_boxes: bool = True
+    include_points: bool = True
+    point_strategy: str = "centroid"
 
 
-def smooth_heatmap(heatmap: np.ndarray, kernel_size: int) -> np.ndarray:
-    if kernel_size <= 1:
-        return heatmap
-    kernel = (kernel_size, kernel_size)
-    return cv2.GaussianBlur(heatmap, kernel, 0)
+@dataclass
+class RegionProposal:
+    """A binary region with metadata used to create SAM2 prompts."""
+
+    label: int
+    mask: np.ndarray
+    bbox: Tuple[int, int, int, int]
+    centroid: Tuple[int, int]
+    score: float
 
 
-def threshold_heatmap(heatmap: np.ndarray, config: PromptConfig) -> np.ndarray:
-    if config.threshold_strategy == "percentile":
-        thresh_value = np.percentile(heatmap, config.percentile)
-    elif config.threshold_strategy == "value":
-        thresh_value = config.threshold
-    else:
-        raise ValueError(f"Unsupported threshold strategy: {config.threshold_strategy}")
-    mask = (heatmap >= thresh_value).astype(np.uint8)
-    return mask
+def _initialise_centroids(features: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
+    if k == 1:
+        return features.mean(axis=0, keepdims=True)
+    indices = rng.choice(len(features), size=k, replace=False)
+    return features[indices]
 
 
-def find_components(binary_map: np.ndarray, min_area: int, max_components: int) -> List[np.ndarray]:
-    contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contour_list = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area >= min_area:
-            contour_list.append(cnt)
-    contour_list.sort(key=cv2.contourArea, reverse=True)
-    return contour_list[:max_components]
+def _assign_clusters(features: np.ndarray, centroids: np.ndarray) -> np.ndarray:
+    distances = np.linalg.norm(features[:, None, :] - centroids[None, :, :], axis=2)
+    return distances.argmin(axis=1)
 
 
-def contour_to_box(contour: np.ndarray) -> List[int]:
-    x, y, w, h = cv2.boundingRect(contour)
-    return [int(x), int(y), int(x + w), int(y + h)]
+def _update_centroids(features: np.ndarray, labels: np.ndarray, centroids: np.ndarray) -> np.ndarray:
+    new_centroids = centroids.copy()
+    for idx in range(centroids.shape[0]):
+        mask = labels == idx
+        if np.any(mask):
+            new_centroids[idx] = features[mask].mean(axis=0)
+    return new_centroids
 
 
-def sample_positive_points(box: Sequence[int], count: int) -> List[Tuple[int, int]]:
-    x0, y0, x1, y1 = box
-    cx = int((x0 + x1) / 2)
-    cy = int((y0 + y1) / 2)
-    points = [(cx, cy)]
-    if count <= 1:
-        return points
-    xs = np.linspace(x0, x1, num=count + 2, dtype=int)[1:-1]
-    ys = np.linspace(y0, y1, num=count + 2, dtype=int)[1:-1]
-    for x in xs:
-        for y in ys:
-            if len(points) >= count:
-                break
-            points.append((int(x), int(y)))
-        if len(points) >= count:
+def kmeans_cluster(features: np.ndarray, config: ClusterConfig) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple numpy k-means implementation for deterministic unit tests."""
+
+    k = min(config.num_clusters, len(features))
+    if k == 0:
+        raise ValueError("No features provided for clustering")
+    rng = np.random.default_rng(config.random_state)
+    centroids = _initialise_centroids(features, k, rng)
+    labels = np.zeros(len(features), dtype=np.int32)
+    for _ in range(config.max_iterations):
+        labels = _assign_clusters(features, centroids)
+        new_centroids = _update_centroids(features, labels, centroids)
+        if np.allclose(new_centroids, centroids):
             break
-    return points[:count]
+        centroids = new_centroids
+    return labels, centroids
 
 
-def sample_negative_points(box: Sequence[int], count: int, offset: int, image_shape: Tuple[int, int]) -> List[Tuple[int, int]]:
-    if count <= 0:
-        return []
-    height, width = image_shape[:2]
-    x0, y0, x1, y1 = box
-    candidates = [
-        (max(x0 - offset, 0), max(y0 - offset, 0)),
-        (min(x1 + offset, width - 1), max(y0 - offset, 0)),
-        (max(x0 - offset, 0), min(y1 + offset, height - 1)),
-        (min(x1 + offset, width - 1), min(y1 + offset, height - 1)),
-    ]
-    unique = []
-    for pt in candidates:
-        if pt not in unique:
-            unique.append(pt)
-        if len(unique) >= count:
-            break
-    return unique
+def _resize_label_map(label_map: np.ndarray, width: int, height: int) -> np.ndarray:
+    image = Image.fromarray(label_map.astype(np.int32), mode="I")
+    resized = image.resize((width, height), resample=Image.NEAREST)
+    return np.array(resized, dtype=np.int32)
 
 
-def generate_prompts_from_heatmap(heatmap: np.ndarray, config: PromptConfig) -> Tuple[List[List[int]], List[List[Tuple[int, int]]], List[List[int]]]:
-    if config.normalize:
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
-    smoothed = smooth_heatmap(heatmap, config.smoothing_kernel)
-    binary = threshold_heatmap(smoothed, config)
-    contours = find_components(binary, config.min_component_area, config.max_components)
+def labels_to_regions(
+    label_map: np.ndarray,
+    image_shape: Tuple[int, int],
+    config: ClusterConfig,
+) -> List[RegionProposal]:
+    height, width = image_shape
+    proposals: List[RegionProposal] = []
+    upscale = _resize_label_map(label_map, width, height)
+    for label in np.unique(upscale):
+        mask_bool = upscale == int(label)
+        area = int(mask_bool.sum())
+        if area < config.min_region_area:
+            continue
+        ys, xs = np.nonzero(mask_bool)
+        if len(xs) == 0:
+            continue
+        x0, x1 = xs.min(), xs.max() + 1
+        y0, y1 = ys.min(), ys.max() + 1
+        cx = int(np.round(xs.mean()))
+        cy = int(np.round(ys.mean()))
+        proposals.append(
+            RegionProposal(
+                label=int(label),
+                mask=mask_bool.astype(np.uint8),
+                bbox=(int(x0), int(y0), int(x1), int(y1)),
+                centroid=(cx, cy),
+                score=float(area),
+            )
+        )
+    proposals.sort(key=lambda item: item.score, reverse=True)
+    return proposals[: config.max_regions]
+
+
+def proposals_to_prompts(
+    proposals: Sequence[RegionProposal],
+    config: PromptConfig,
+) -> Tuple[List[List[int]], List[List[Tuple[int, int]]], List[List[int]]]:
     boxes: List[List[int]] = []
-    positive_points: List[List[Tuple[int, int]]] = []
+    points: List[List[Tuple[int, int]]] = []
     labels: List[List[int]] = []
-
-    for contour in contours:
-        box = contour_to_box(contour)
-        boxes.append(box)
-        pos_points = sample_positive_points(box, config.positive_points_per_box)
-        neg_points = sample_negative_points(box, config.negative_points_per_box, config.negative_offset, heatmap.shape)
-        positive_points.append(pos_points + neg_points)
-        labels.append([1] * len(pos_points) + [0] * len(neg_points))
-
-    return boxes, positive_points, labels
+    for proposal in proposals:
+        prompt_points: List[Tuple[int, int]] = []
+        point_labels: List[int] = []
+        if config.include_boxes:
+            boxes.append(list(proposal.bbox))
+        if config.include_points:
+            prompt_points.append(proposal.centroid)
+            point_labels.append(1)
+        if prompt_points:
+            points.append(prompt_points)
+            labels.append(point_labels)
+        else:
+            points.append([])
+            labels.append([])
+    return boxes, points, labels
