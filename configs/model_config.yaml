@@ -2,10 +2,10 @@ device: "cuda"
 dtype: "float16"
 dinov3:
   repo_or_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
-  model_name: "dinov3_vitl16"
+  model_name: "dinov3_vith16plus"
   use_torch_hub: true
   torchhub_source: "local"
-  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_lvd1689m.pth"
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vith16plus.pth"
   output_layer: -1
 sam2:
   backend: "official"
@@ -29,6 +29,16 @@ pipeline:
   output_mask_format: "png"
   save_visualization: true
   visualization_alpha: 0.5
+  cluster:
+    num_clusters: 6
+    max_iterations: 30
+    random_state: 0
+    min_region_area: 800
+    max_regions: 5
+  prompt:
+    include_boxes: true
+    include_points: true
+    point_strategy: "centroid"
 reconstruction:
   output_directory: "outputs/recon_inputs"
   save_metadata: true
