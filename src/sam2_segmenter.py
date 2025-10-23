@@ -45,6 +45,7 @@ class SAM2Segmenter:
     def _load_official_model(self) -> None:
         if not self.config.checkpoint_path or not self.config.model_config:
             raise ValueError("SAM2 official backend requires checkpoint_path and model_config")
+        
         try:
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -58,11 +59,110 @@ class SAM2Segmenter:
             self.config.checkpoint_path,
             self.config.model_config,
         )
-        sam2_model = build_sam2(self.config.model_config, self.config.checkpoint_path, device=self.device)
+        
+        import os
+        from pathlib import Path
+        
+        # Method 1: Try to use build_sam2 with proper Hydra initialization
+        try:
+            # Find the sam2 package location
+            import sam2
+            sam2_package_path = Path(sam2.__file__).parent
+            config_dir = sam2_package_path / "configs"
+            
+            LOGGER.info(f"SAM2 package path: {sam2_package_path}")
+            LOGGER.info(f"Config directory: {config_dir}")
+            
+            if not config_dir.exists():
+                raise FileNotFoundError(f"SAM2 configs directory not found at {config_dir}")
+            
+            # Initialize Hydra with the correct config path
+            from hydra import compose, initialize_config_dir
+            from hydra.core.global_hydra import GlobalHydra
+            
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+            
+            # Initialize with SAM2's config directory
+            with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                # Now build_sam2 should work
+                sam2_model = build_sam2(
+                    self.config.model_config, 
+                    self.config.checkpoint_path, 
+                    device=self.device
+                )
+            
+            LOGGER.info("✅ Successfully loaded SAM2 model using Hydra initialization")
+            
+        except Exception as e:
+            LOGGER.warning(f"Failed to load with Hydra initialization: {e}")
+            LOGGER.info("Attempting alternative loading method...")
+            
+            # Method 2: Load config manually and build model directly
+            try:
+                import yaml
+                import sam2
+                from hydra.utils import instantiate
+                from omegaconf import OmegaConf
+                
+                # Find config file
+                sam2_package_path = Path(sam2.__file__).parent
+                config_path = sam2_package_path / "configs" / f"{self.config.model_config}.yaml"
+                
+                if not config_path.exists():
+                    raise FileNotFoundError(f"Config file not found: {config_path}")
+                
+                LOGGER.info(f"Loading config from: {config_path}")
+                
+                # Load the YAML config
+                with open(config_path, 'r') as f:
+                    cfg_dict = yaml.safe_load(f)
+                
+                # Convert to OmegaConf
+                cfg = OmegaConf.create(cfg_dict)
+                
+                # Instantiate the model using the config
+                sam2_model = instantiate(cfg, _recursive_=False)
+                
+                # Load checkpoint
+                LOGGER.info(f"Loading checkpoint: {self.config.checkpoint_path}")
+                checkpoint = torch.load(self.config.checkpoint_path, map_location="cpu")
+                
+                # Handle different checkpoint formats
+                if "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+                
+                # Load state dict
+                missing_keys, unexpected_keys = sam2_model.load_state_dict(state_dict, strict=False)
+                
+                if missing_keys:
+                    LOGGER.warning(f"Missing keys: {missing_keys[:5]}...")
+                if unexpected_keys:
+                    LOGGER.warning(f"Unexpected keys: {unexpected_keys[:5]}...")
+                
+                # Move to device
+                sam2_model = sam2_model.to(self.device)
+                
+                LOGGER.info("✅ Successfully loaded SAM2 model using manual config loading")
+                
+            except Exception as e2:
+                LOGGER.error(f"Both loading methods failed. Last error: {e2}")
+                raise RuntimeError(
+                    f"Failed to load SAM2 model. "
+                    f"Config: {self.config.model_config}, "
+                    f"Checkpoint: {self.config.checkpoint_path}"
+                ) from e2
+        
+        # Create predictor
         self.predictor = SAM2ImagePredictor(sam2_model, device=self.device)
         self.model = sam2_model
         self.processor = None
         self._backend = "official"
+        
+        LOGGER.info("SAM2 model loaded successfully")
 
     def _load_huggingface_model(self) -> None:
         from transformers import Sam2Model, Sam2Processor
@@ -117,7 +217,7 @@ class SAM2Segmenter:
             raise RuntimeError("Hugging Face SAM2 backend is not initialized")
         inputs = self._prepare_inputs(image, boxes=boxes, points=points, labels=labels)
         if self.device.type == "cuda" and not self.config.load_in_8bit:
-            autocast_context = torch.cuda.amp.autocast(enabled=self.dtype == torch.float16)
+            autocast_context = torch.amp.autocast('cuda', enabled=self.dtype == torch.float16)
         else:
             from contextlib import nullcontext
 
@@ -174,10 +274,17 @@ class SAM2Segmenter:
     ) -> List[np.ndarray]:
         if self.predictor is None:
             raise RuntimeError("Official SAM2 backend is not initialized")
+        
+        # Ensure image is in the correct format
         rgb_image = image
         if rgb_image.dtype != np.uint8:
             rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
-        bgr_image = rgb_image[..., ::-1]
+        
+        # Convert RGB to BGR for SAM2
+        # IMPORTANT: Use copy() to avoid negative strides
+        bgr_image = rgb_image[:, :, ::-1].copy()
+        
+        # Set the image
         self.predictor.set_image(bgr_image)
 
         num_prompts = 0

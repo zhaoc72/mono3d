@@ -10,16 +10,17 @@ dinov3:
 sam2:
   backend: "official"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
-  model_config: "/media/pc/D/zhaochen/mono3d/sam2/sam2/sam2_hiera_l.yaml"
+  # Use just the config name, not the full path. SAM2 will look for this in its configs/ directory
+  model_config: "sam2.1/sam2.1_hiera_l"
   model_id: null
   revision: null
   load_in_8bit: false
   max_batch_size: 32
 pipeline:
   input_size: null
-  heat_threshold: 0.6
-  min_box_area: 5000
-  area_threshold: 10000
+  heat_threshold: 0.5
+  min_box_area: 1000
+  area_threshold: 1000
   kernel_size: 5
   dilation_radius: 3
   frame_skip: 1
