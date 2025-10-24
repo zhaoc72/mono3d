@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torchvision import transforms
 
 from .utils import LOGGER
@@ -21,11 +22,18 @@ class Dinov3Config:
     use_torch_hub: bool = True
     checkpoint_path: Optional[str] = None
     image_size: int = 518
-    output_layers: Sequence[int] = (0,)
+    output_layers: Sequence[int] = (4, 8, 12)  # 多层特征
     patch_size: int = 14
     normalize: bool = True
     torchhub_source: Optional[str] = None
     output_layer: Optional[int] = None
+    
+    # 新增：多层特征融合配置
+    layer_weights: Optional[Sequence[float]] = None  # 层权重，如 (0.3, 0.3, 0.4)
+    fusion_method: str = "weighted_concat"  # weighted_concat, weighted_sum, concat
+    enable_pca: bool = False  # 是否启用 PCA 降维
+    pca_dim: int = 32  # PCA 降维目标维度
+    enable_objectness: bool = True  # 是否计算对象性评分
 
     def __post_init__(self) -> None:
         """Normalize legacy configuration options."""
@@ -53,6 +61,28 @@ class Dinov3Config:
 
         object.__setattr__(self, "output_layers", tuple(normalized))
         object.__setattr__(self, "output_layer", None)
+        
+        # 初始化层权重
+        if self.layer_weights is None:
+            n_layers = len(self.output_layers)
+            # 默认：后面的层权重更大
+            weights = [0.2 + 0.3 * (i / max(1, n_layers - 1)) for i in range(n_layers)]
+            weights = [w / sum(weights) for w in weights]  # 归一化
+            object.__setattr__(self, "layer_weights", tuple(weights))
+        else:
+            # 验证权重
+            if len(self.layer_weights) != len(self.output_layers):
+                raise ValueError(
+                    f"layer_weights length {len(self.layer_weights)} must match "
+                    f"output_layers length {len(self.output_layers)}"
+                )
+            # 归一化权重
+            weights = list(self.layer_weights)
+            total = sum(weights)
+            if total > 0:
+                weights = [w / total for w in weights]
+            object.__setattr__(self, "layer_weights", tuple(weights))
+
 
 class DINOv3FeatureExtractor:
     """Wrapper that exposes patch embeddings and attention maps from DINOv3."""
@@ -63,6 +93,11 @@ class DINOv3FeatureExtractor:
         self.dtype = dtype
         self.model = self._load_model()
         self.model.eval()
+        
+        # PCA 组件（延迟初始化）
+        self.pca = None
+        self.pca_fitted = False
+        
         transform_steps = [
             transforms.ToPILImage(),
             transforms.Resize((config.image_size, config.image_size)),
@@ -185,48 +220,169 @@ class DINOv3FeatureExtractor:
             attention = self.model.get_last_selfattention()
         return attention.detach().to("cpu") if isinstance(attention, torch.Tensor) else None
 
-    @torch.inference_mode()
+    def _fuse_multilayer_features(
+        self, 
+        layer_features: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        融合多层特征
+        
+        Args:
+            layer_features: List of [N, D_i] tensors
+            
+        Returns:
+            Fused features [N, D_out]
+        """
+        if len(layer_features) == 1:
+            return layer_features[0]
+        
+        # L2 归一化每一层
+        normalized = [F.normalize(feat, dim=-1) for feat in layer_features]
+        
+        if self.config.fusion_method == "weighted_concat":
+            # 加权后拼接
+            weighted = [feat * w for feat, w in zip(normalized, self.config.layer_weights)]
+            fused = torch.cat(weighted, dim=-1)
+            
+        elif self.config.fusion_method == "weighted_sum":
+            # 加权求和（要求所有层维度相同）
+            weighted = [feat * w for feat, w in zip(normalized, self.config.layer_weights)]
+            fused = torch.stack(weighted, dim=0).sum(dim=0)
+            
+        elif self.config.fusion_method == "concat":
+            # 简单拼接
+            fused = torch.cat(normalized, dim=-1)
+            
+        else:
+            raise ValueError(f"Unknown fusion method: {self.config.fusion_method}")
+        
+        # 最终 L2 归一化
+        fused = F.normalize(fused, dim=-1)
+        
+        return fused
 
+    def _apply_pca(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        对特征应用 PCA 降维
+        
+        Args:
+            features: [N, D] tensor
+            
+        Returns:
+            Reduced features [N, pca_dim]
+        """
+        if not self.config.enable_pca:
+            return features
+        
+        # 转到 CPU 进行 PCA
+        features_cpu = features.cpu().numpy()
+        
+        if not self.pca_fitted:
+            from sklearn.decomposition import PCA
+            self.pca = PCA(n_components=self.config.pca_dim, random_state=0)
+            reduced = self.pca.fit_transform(features_cpu)
+            self.pca_fitted = True
+            LOGGER.info(
+                f"PCA fitted: {features.shape[1]} -> {self.config.pca_dim} dims, "
+                f"explained variance: {self.pca.explained_variance_ratio_.sum():.3f}"
+            )
+        else:
+            reduced = self.pca.transform(features_cpu)
+        
+        return torch.from_numpy(reduced).to(features.device, dtype=features.dtype)
+
+    def _compute_objectness(self, patch_features: torch.Tensor) -> np.ndarray:
+        """
+        计算对象性评分
+        
+        Args:
+            patch_features: [N, D] tensor
+            
+        Returns:
+            Objectness scores [N] numpy array
+        """
+        # 归一化特征
+        patch_features_norm = F.normalize(patch_features, dim=-1)
+        
+        # 计算相似度矩阵
+        similarity_matrix = torch.mm(patch_features_norm, patch_features_norm.t())
+        
+        # 对每个 patch，计算其与最相似的 K 个邻居的平均相似度
+        K = min(20, len(patch_features) - 1)
+        topk_sim, _ = torch.topk(similarity_matrix, k=K + 1, dim=1, largest=True)
+        avg_similarity = topk_sim[:, 1:].mean(dim=1)  # 排除自己
+        
+        # 对象性 = 1 - 相似度（越独特 = 越可能是物体）
+        objectness = (1 - avg_similarity).cpu().numpy()
+        
+        return objectness
+
+    @torch.inference_mode()
     def extract_features(self, image: np.ndarray) -> Dict[str, object]:
         """Return patch embeddings, class token features and optional attention."""
 
         inputs = self._prepare(image)
         layers = self._gather_layers(inputs)
         separated = [self._split_tokens(layer) for layer in layers]
-        patch_tokens = torch.stack([pair[0] for pair in separated], dim=0)  # L x B x P x D
-        cls_tokens = torch.stack([pair[1] for pair in separated], dim=0)  # L x B x D
-        patch_tokens = patch_tokens.mean(dim=0).squeeze(0).to("cpu")
-        cls_tokens = cls_tokens.mean(dim=0).squeeze(0).to("cpu")
-        num_tokens = patch_tokens.shape[0]
+        
+        # 提取每层的 patch tokens
+        layer_patch_tokens = [pair[0].squeeze(0) for pair in separated]  # List of [P, D_i]
+        layer_cls_tokens = [pair[1].squeeze(0) for pair in separated]     # List of [D_i]
+        
+        # 多层特征融合
+        LOGGER.debug(f"Fusing {len(layer_patch_tokens)} layers with method: {self.config.fusion_method}")
+        fused_patch_tokens = self._fuse_multilayer_features(layer_patch_tokens)
+        
+        # PCA 降维（可选）
+        if self.config.enable_pca:
+            fused_patch_tokens = self._apply_pca(fused_patch_tokens)
+        
+        # 转到 CPU
+        fused_patch_tokens = fused_patch_tokens.to("cpu")
+        cls_tokens = torch.stack(layer_cls_tokens, dim=0).mean(dim=0).to("cpu")
+        
+        # 计算 grid size
+        num_tokens = fused_patch_tokens.shape[0]
         grid_size = int(round(np.sqrt(num_tokens)))
         if grid_size * grid_size != num_tokens:
             raise ValueError(
                 f"Number of patch tokens ({num_tokens}) does not form a square grid"
             )
-        patch_map = patch_tokens.reshape(grid_size, grid_size, -1)
-
+        
+        # 重塑为 spatial map
+        patch_map = fused_patch_tokens.reshape(grid_size, grid_size, -1)
+        
+        # 获取 attention map
         attention = self._gather_attention(inputs)
         attention_map = None
         if attention is not None:
-            # Convert attention tensor [B, heads, tokens, tokens] to a spatial heatmap.
             attn = attention.mean(dim=1)[0]  # tokens x tokens
             cls_attention = attn[0, 1:]
             attention_map = cls_attention.reshape(grid_size, grid_size).numpy()
             attention_map = (attention_map - attention_map.min()) / (
                 attention_map.max() - attention_map.min() + 1e-6
             )
+        
+        # 计算对象性（可选）
+        objectness_map = None
+        if self.config.enable_objectness:
+            objectness_scores = self._compute_objectness(fused_patch_tokens)
+            objectness_map = objectness_scores.reshape(grid_size, grid_size)
+            # 归一化
+            objectness_map = (objectness_map - objectness_map.min()) / (
+                objectness_map.max() - objectness_map.min() + 1e-8
+            )
 
         return {
-            "patch_tokens": patch_tokens,
+            "patch_tokens": fused_patch_tokens,
             "cls_token": cls_tokens,
             "grid_size": (grid_size, grid_size),
             "patch_map": patch_map,
             "attention_map": attention_map,
+            "objectness_map": objectness_map,  # 新增
         }
 
     def to(self, device: torch.device | str) -> "DINOv3FeatureExtractor":
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
         return self
-
-

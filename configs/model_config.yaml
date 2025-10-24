@@ -1,21 +1,34 @@
 device: "cuda"
 dtype: "float16"
+
 dinov3:
   repo_or_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
   model_name: "dinov3_vith16plus"
   use_torch_hub: true
   torchhub_source: "local"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vith16plus.pth"
-  output_layer: -1
+  
+  # 多层特征融合配置
+  output_layers: [4, 8, 12]
+  layer_weights: [0.2, 0.3, 0.5]
+  fusion_method: "weighted_concat"  # weighted_concat, weighted_sum, concat
+  
+  # PCA 降维
+  enable_pca: false
+  pca_dim: 32
+  
+  # 对象性评分
+  enable_objectness: true
+
 sam2:
   backend: "official"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
-  # Use just the config name, not the full path. SAM2 will look for this in its configs/ directory
   model_config: "sam2.1/sam2.1_hiera_l"
   model_id: null
   revision: null
   load_in_8bit: false
   max_batch_size: 32
+
 pipeline:
   input_size: null
   heat_threshold: 0.8
@@ -29,16 +42,63 @@ pipeline:
   output_mask_format: "png"
   save_visualization: true
   visualization_alpha: 0.5
+  
+  # NMS 配置
+  enable_nms: true
+  iou_threshold: 0.6
+  objectness_weight: 0.5
+  confidence_weight: 0.3
+  area_weight: 0.2
+  
+  # 超像素配置
+  use_superpixels: false  # 启用超像素辅助
+  superpixel:
+    method: "slic"  # slic, felzenszwalb, seeds
+    n_segments: 1000
+    compactness: 10.0
+    sigma: 1.0
+  
+  # 图聚类配置
+  use_graph_clustering: false
+  graph_cluster:
+    method: "spectral"  # spectral, louvain, label_propagation
+    n_clusters: 6
+    affinity: "rbf"
+    gamma: 1.0
+    n_neighbors: 10
+  
+  # 密度聚类配置
+  use_density_clustering: false
+  density_cluster:
+    method: "hdbscan"  # hdbscan, meanshift, dbscan
+    min_cluster_size: 50
+    min_samples: 10
+  
+  # CRF 细化配置
+  crf:
+    enable: false
+    max_iterations: 5
+    pos_w: 3.0
+    pos_xy_std: 3.0
+    bi_w: 5.0
+    bi_xy_std: 50.0
+    bi_rgb_std: 5.0
+  
   cluster:
     num_clusters: 6
     max_iterations: 30
     random_state: 0
     min_region_area: 400
-    max_regions: 5
+    max_regions: 10
+    use_objectness_filter: true
+    objectness_threshold: 0.3
+    objectness_weight: 0.5
+    
   prompt:
     include_boxes: true
     include_points: true
     point_strategy: "centroid"
+
 reconstruction:
   output_directory: "outputs/recon_inputs"
   save_metadata: true
