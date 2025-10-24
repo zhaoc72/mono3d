@@ -72,15 +72,21 @@ class DensityClusterer:
         )
         
         labels = clusterer.fit_predict(features)
-        
+
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         n_noise = list(labels).count(-1)
-        
+
         LOGGER.info(
             f"HDBSCAN: {len(features)} points -> {n_clusters} clusters, "
             f"{n_noise} noise points"
         )
-        
+
+        if n_clusters == 0:
+            LOGGER.warning(
+                "HDBSCAN returned only noise points; falling back to MeanShift clustering"
+            )
+            return self._meanshift_clustering(features)
+
         return labels
     
     def _meanshift_clustering(self, features: np.ndarray) -> np.ndarray:
@@ -170,6 +176,12 @@ def handle_noise_points(
         
         valid_mask = ~noise_mask
         valid_labels = np.unique(labels[valid_mask])
+
+        if valid_labels.size == 0:
+            LOGGER.warning(
+                "All points labelled as noise; skipping nearest-cluster reassignment"
+            )
+            return labels
         
         # 计算每个聚类的质心
         centroids = []
