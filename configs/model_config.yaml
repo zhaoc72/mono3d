@@ -8,16 +8,11 @@ dinov3:
   torchhub_source: "local"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vith16plus.pth"
   
-  # 多层特征融合配置
-  output_layers: [4, 8, 12]
-  layer_weights: [0.2, 0.3, 0.5]
-  fusion_method: "weighted_concat"  # weighted_concat, weighted_sum, concat
+  output_layers: [8, 12]
+  layer_weights: [0.4, 0.6]
+  fusion_method: "weighted_sum"
   
-  # PCA 降维
   enable_pca: false
-  pca_dim: 32
-  
-  # 对象性评分
   enable_objectness: true
 
 sam2:
@@ -28,76 +23,69 @@ sam2:
   revision: null
   load_in_8bit: false
   max_batch_size: 32
+  mask_selection_strategy: "best_balanced"
 
 pipeline:
-  input_size: null
-  heat_threshold: 0.8
-  min_box_area: 200
   area_threshold: 100
   kernel_size: 7
   dilation_radius: 5
   
-  frame_skip: 1
-  max_prompts_per_batch: 32
   output_mask_format: "png"
   save_visualization: true
   visualization_alpha: 0.5
   
-  # NMS 配置
   enable_nms: true
-  iou_threshold: 0.6
-  objectness_weight: 0.5
-  confidence_weight: 0.3
-  area_weight: 0.2
+  iou_threshold: 0.5
+  objectness_weight: 0.3
+  confidence_weight: 0.4
+  area_weight: 0.3
   
-  # 超像素配置
-  use_superpixels: false  # 启用超像素辅助
-  superpixel:
-    method: "slic"  # slic, felzenszwalb, seeds
-    n_segments: 1000
-    compactness: 10.0
-    sigma: 1.0
-  
-  # 图聚类配置
+  use_superpixels: false
   use_graph_clustering: false
-  graph_cluster:
-    method: "spectral"  # spectral, louvain, label_propagation
-    n_clusters: 6
-    affinity: "rbf"
-    gamma: 1.0
-    n_neighbors: 10
-  
-  # 密度聚类配置
   use_density_clustering: false
-  density_cluster:
-    method: "hdbscan"  # hdbscan, meanshift, dbscan
-    min_cluster_size: 50
-    min_samples: 10
   
-  # CRF 细化配置
   crf:
-    enable: false
-    max_iterations: 5
+    enable: true
+    max_iterations: 10
     pos_w: 3.0
     pos_xy_std: 3.0
-    bi_w: 5.0
+    bi_w: 10.0
     bi_xy_std: 50.0
     bi_rgb_std: 5.0
   
   cluster:
+    # ===== 自适应聚类配置 =====
+    clustering_method: "adaptive"  # fixed, adaptive, hdbscan, meanshift
+    
+    # Fixed方法参数（仅当clustering_method="fixed"时使用）
     num_clusters: 6
+    
+    # Adaptive方法参数
+    min_clusters: 3       # 最小聚类数
+    max_clusters: 15      # 最大聚类数
+    cluster_selection_method: "silhouette"  # elbow, silhouette
+    
+    # 通用参数
     max_iterations: 30
     random_state: 0
-    min_region_area: 400
-    max_regions: 10
-    use_objectness_filter: true
+    min_region_area: 200
+    max_regions: 20
+    min_instance_area: 200
+    
+    use_objectness_filter: false
     objectness_threshold: 0.3
     objectness_weight: 0.5
+    
+    use_connected_components: true
+    min_component_area: 150
     
   prompt:
     include_boxes: true
     include_points: true
-    point_strategy: "centroid"
+    point_strategy: "density"
+    max_points_per_region: 5
+    density_noise_handling: "nearest"
+    grid_points_per_side: 3
 
 reconstruction:
   output_directory: "outputs/recon_inputs"

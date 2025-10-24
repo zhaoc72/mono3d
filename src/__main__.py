@@ -31,7 +31,6 @@ def parse_args() -> argparse.Namespace:
     
     subparsers = parser.add_subparsers(dest="mode", help="Inference mode")
     
-    # Image mode
     image_parser = subparsers.add_parser("image", help="Process a single image")
     image_parser.add_argument("--input", required=True, help="Path to input image")
     image_parser.add_argument("--output", required=True, help="Output directory")
@@ -40,14 +39,12 @@ def parse_args() -> argparse.Namespace:
     image_parser.add_argument("--visualize-intermediate", action="store_true", 
                              help="Save intermediate visualization results")
     
-    # Directory mode
     dir_parser = subparsers.add_parser("directory", help="Process a directory of images")
     dir_parser.add_argument("--input", required=True, help="Input directory")
     dir_parser.add_argument("--output", required=True, help="Output directory")
     dir_parser.add_argument("--config", required=True, help="Model config YAML")
     dir_parser.add_argument("--prompt-config", help="Prompt config YAML")
     
-    # Video mode
     video_parser = subparsers.add_parser("video", help="Process a video file")
     video_parser.add_argument("--input", required=True, help="Path to video file")
     video_parser.add_argument("--output", required=True, help="Output directory")
@@ -55,7 +52,6 @@ def parse_args() -> argparse.Namespace:
     video_parser.add_argument("--prompt-config", help="Prompt config YAML")
     video_parser.add_argument("--frame-skip", type=int, default=1, help="Frame sampling interval")
     
-    # VKITTI mode
     vkitti_parser = subparsers.add_parser("vkitti", help="Process Virtual KITTI 2 dataset")
     vkitti_parser.add_argument("--input", required=True, help="VKITTI2 root directory")
     vkitti_parser.add_argument("--output", required=True, help="Output directory")
@@ -73,11 +69,8 @@ def load_configs(config_path: str, prompt_config_path: Optional[str] = None) -> 
     """Load configuration files."""
     config = load_yaml(config_path)
     
-    # prompt_config.yaml 中的配置不直接用于初始化
-    # 它们是运行时参数，在这里只是加载并存储到 config 中
     if prompt_config_path:
         prompt_config = load_yaml(prompt_config_path)
-        # 将 prompt_config 存储为单独的键，不合并到 prompt 中
         config["prompt_config_yaml"] = prompt_config
     
     return config
@@ -90,28 +83,70 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
     
     LOGGER.info(f"Using device: {device}, dtype: {dtype}")
     
-    # DINOv3 config
     LOGGER.info("Initializing DINOv3...")
     dinov3_cfg = Dinov3Config(**config["dinov3"])
     
-    # SAM2 config
     LOGGER.info("Initializing SAM2...")
     sam2_cfg = Sam2Config(**config["sam2"])
     
-    # Pipeline config
     pipeline_dict = config.get("pipeline", {})
     
-    cluster_cfg = ClusterConfig(**pipeline_dict.get("cluster", {}))
+    # 读取 prompt_config_yaml（如果有）
+    prompt_config_yaml = config.get("prompt_config_yaml", {})
+    points_config = prompt_config_yaml.get("points", {})
     
-    # PromptConfig - 只使用它支持的参数
+    # ClusterConfig - 支持自适应聚类
+    cluster_dict = pipeline_dict.get("cluster", {})
+    cluster_cfg = ClusterConfig(
+        # 聚类方法
+        clustering_method=cluster_dict.get("clustering_method", "adaptive"),
+        
+        # Fixed方法参数
+        num_clusters=cluster_dict.get("num_clusters", 6),
+        
+        # Adaptive方法参数
+        min_clusters=cluster_dict.get("min_clusters", 3),
+        max_clusters=cluster_dict.get("max_clusters", 20),
+        cluster_selection_method=cluster_dict.get("cluster_selection_method", "elbow"),
+        
+        # 通用参数
+        max_iterations=cluster_dict.get("max_iterations", 30),
+        random_state=cluster_dict.get("random_state", 0),
+        min_region_area=cluster_dict.get("min_region_area", 200),
+        max_regions=cluster_dict.get("max_regions", 20),
+        min_instance_area=cluster_dict.get("min_instance_area", 200),
+        
+        use_objectness_filter=cluster_dict.get("use_objectness_filter", False),
+        objectness_threshold=cluster_dict.get("objectness_threshold", 0.3),
+        objectness_weight=cluster_dict.get("objectness_weight", 0.5),
+        use_connected_components=cluster_dict.get("use_connected_components", True),
+        min_component_area=cluster_dict.get("min_component_area", 150),
+    )
+    
+    LOGGER.info(f"Clustering method: {cluster_cfg.clustering_method}")
+    if cluster_cfg.clustering_method == "adaptive":
+        LOGGER.info(f"  Adaptive range: {cluster_cfg.min_clusters}-{cluster_cfg.max_clusters}")
+        LOGGER.info(f"  Selection method: {cluster_cfg.cluster_selection_method}")
+    elif cluster_cfg.clustering_method == "fixed":
+        LOGGER.info(f"  Fixed k: {cluster_cfg.num_clusters}")
+    
+    # PromptConfig - 合并两个配置文件
     prompt_dict = pipeline_dict.get("prompt", {})
+    
+    # 优先使用 prompt_config.yaml 中的配置
+    point_strategy = points_config.get("point_strategy", prompt_dict.get("point_strategy", "density"))
+    max_points = points_config.get("positive_points_per_box", prompt_dict.get("max_points_per_region", 5))
+    
     prompt_cfg = PromptConfig(
         include_boxes=prompt_dict.get("include_boxes", True),
         include_points=prompt_dict.get("include_points", True),
-        point_strategy=prompt_dict.get("point_strategy", "density"),
-        max_points_per_region=prompt_dict.get("max_points_per_region", 5),
+        point_strategy=point_strategy,
+        max_points_per_region=max_points,
         density_noise_handling=prompt_dict.get("density_noise_handling", "nearest"),
+        grid_points_per_side=prompt_dict.get("grid_points_per_side", 3),
     )
+    
+    LOGGER.info(f"Prompt strategy: {prompt_cfg.point_strategy}, max_points: {prompt_cfg.max_points_per_region}")
     
     superpixel_cfg = SuperpixelConfig(**pipeline_dict.get("superpixel", {}))
     graph_cluster_cfg = GraphClusterConfig(**pipeline_dict.get("graph_cluster", {}))
@@ -130,7 +165,6 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
         crf=crf_cfg,
     )
     
-    # Initialize models
     LOGGER.info("Loading models...")
     extractor = DINOv3FeatureExtractor(dinov3_cfg, device, dtype)
     LOGGER.info("✓ DINOv3 loaded")
@@ -175,7 +209,6 @@ def visualize_intermediate_results(
         
         cv2.imwrite(str(viz_dir / "02_attention_map.jpg"), attention_colored)
         
-        # 叠加到原图
         attention_resized = cv2.resize(attention_colored, (image.shape[1], image.shape[0]))
         overlay = cv2.addWeighted(
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.6,
@@ -190,7 +223,6 @@ def visualize_intermediate_results(
         
         cv2.imwrite(str(viz_dir / "03_objectness_map.jpg"), objectness_colored)
         
-        # 叠加到原图
         objectness_resized = cv2.resize(objectness_colored, (image.shape[1], image.shape[0]))
         overlay = cv2.addWeighted(
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.6,
@@ -200,7 +232,6 @@ def visualize_intermediate_results(
     
     # 4. 可视化聚类 Label Map
     if result.label_map is not None:
-        # 为每个标签分配颜色
         unique_labels = np.unique(result.label_map)
         colored_labels = np.zeros((*result.label_map.shape, 3), dtype=np.uint8)
         
@@ -212,7 +243,6 @@ def visualize_intermediate_results(
             ], dtype=np.uint8)
             colored_labels[result.label_map == label] = color
         
-        # 调整大小
         colored_labels_resized = cv2.resize(
             colored_labels,
             (image.shape[1], image.shape[0]),
@@ -224,7 +254,6 @@ def visualize_intermediate_results(
             cv2.cvtColor(colored_labels_resized, cv2.COLOR_RGB2BGR)
         )
         
-        # 叠加
         overlay = cv2.addWeighted(
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5,
             cv2.cvtColor(colored_labels_resized, cv2.COLOR_RGB2BGR), 0.5, 0
@@ -238,7 +267,6 @@ def visualize_intermediate_results(
         for i, proposal in enumerate(result.proposals):
             x0, y0, x1, y1 = proposal.bbox
             
-            # 根据 objectness 分配颜色（红色=低，绿色=高）
             obj_score = proposal.objectness
             color_r = int(255 * (1 - obj_score))
             color_g = int(255 * obj_score)
@@ -246,7 +274,6 @@ def visualize_intermediate_results(
             
             cv2.rectangle(img_with_boxes, (x0, y0), (x1, y1), color, 2)
             
-            # 显示编号和 objectness
             label = f"#{i} obj:{obj_score:.2f}"
             cv2.putText(
                 img_with_boxes, label, (x0, y0-10),
@@ -266,7 +293,6 @@ def visualize_intermediate_results(
         points = result.prompts.get('points', [])
         labels = result.prompts.get('labels', [])
         
-        # 画 boxes
         for i, box in enumerate(boxes):
             x0, y0, x1, y1 = box
             cv2.rectangle(img_with_prompts, (x0, y0), (x1, y1), (0, 255, 0), 2)
@@ -275,7 +301,6 @@ def visualize_intermediate_results(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
             )
         
-        # 画 points
         for i, (prompt_points, prompt_labels) in enumerate(zip(points, labels)):
             for point, label in zip(prompt_points, prompt_labels):
                 x, y = point
@@ -287,9 +312,8 @@ def visualize_intermediate_results(
             cv2.cvtColor(img_with_prompts, cv2.COLOR_RGB2BGR)
         )
     
-    # 7. 可视化最终 Masks (分开显示)
+    # 7. 可视化最终 Masks
     if result.masks:
-        # 彩色组合
         combined = np.zeros_like(image)
         
         for i, mask in enumerate(result.masks):
@@ -305,18 +329,16 @@ def visualize_intermediate_results(
             cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
         )
         
-        # 叠加
         overlay = cv2.addWeighted(
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5,
             cv2.cvtColor(combined, cv2.COLOR_RGB2BGR), 0.5, 0
         )
         cv2.imwrite(str(viz_dir / "07_final_overlay.jpg"), overlay)
         
-        # 单独保存前5个mask
         individual_dir = viz_dir / "individual_masks"
         individual_dir.mkdir(exist_ok=True)
         
-        for i, mask in enumerate(result.masks[:5]):
+        for i, mask in enumerate(result.masks[:10]):
             mask_vis = (mask.astype(np.uint8) * 255)
             cv2.imwrite(str(individual_dir / f"mask_{i:02d}.jpg"), mask_vis)
     
@@ -328,19 +350,15 @@ def visualize_intermediate_results(
 
 2. DINOv3 特征:
    - Attention Map: 02_attention_map.jpg
-   - Attention Overlay: 02_attention_overlay.jpg
    - Objectness Map: 03_objectness_map.jpg
-   - Objectness Overlay: 03_objectness_overlay.jpg
 
 3. 聚类结果:
    - Cluster Labels: 04_cluster_labels.jpg
-   - Cluster Overlay: 04_cluster_overlay.jpg
    - 聚类数量: {len(np.unique(result.label_map)) if result.label_map is not None else 0}
 
 4. 候选区域:
    - Proposals: 05_proposals_boxes.jpg
    - 候选数量: {len(result.proposals)}
-   - Objectness 范围: [{min(p.objectness for p in result.proposals):.3f}, {max(p.objectness for p in result.proposals):.3f}]
 
 5. SAM2 Prompts:
    - Prompts: 06_prompts.jpg
@@ -349,9 +367,7 @@ def visualize_intermediate_results(
 
 6. 最终分割:
    - Final Masks: 07_final_masks.jpg
-   - Final Overlay: 07_final_overlay.jpg
    - Mask 数量: {len(result.masks)}
-   - Individual Masks: individual_masks/ (前5个)
 
 === 统计信息 ===
 
@@ -374,6 +390,44 @@ Proposals:
     LOGGER.info(f"✓ Intermediate visualizations saved to {viz_dir}")
 
 
+def postprocess_mask(mask: np.ndarray, kernel_size: int = 7) -> np.ndarray:
+    """
+    后处理单个mask
+    
+    1. 闭运算填充小孔
+    2. 去除小连通域
+    """
+    try:
+        from scipy.ndimage import label as connected_components
+    except ImportError:
+        # 如果没有scipy，只做形态学操作
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        mask_closed = cv2.morphologyEx(
+            mask.astype(np.uint8), 
+            cv2.MORPH_CLOSE, 
+            kernel
+        )
+        return mask_closed.astype(np.uint8)
+    
+    # 1. 闭运算
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    mask_closed = cv2.morphologyEx(
+        mask.astype(np.uint8), 
+        cv2.MORPH_CLOSE, 
+        kernel
+    )
+    
+    # 2. 去除小连通域，只保留最大的
+    labeled, num = connected_components(mask_closed)
+    if num > 1:
+        sizes = [np.sum(labeled == i) for i in range(1, num + 1)]
+        if sizes:
+            max_component = np.argmax(sizes) + 1
+            mask_closed = (labeled == max_component).astype(np.uint8)
+    
+    return mask_closed
+
+
 def process_and_save(
     pipeline: ZeroShotSegmentationPipeline,
     image: np.ndarray,
@@ -384,7 +438,6 @@ def process_and_save(
     visualize_intermediate: bool = False,
 ) -> int:
     """Process an image and save results."""
-    # NMS config
     pipeline_dict = config.get("pipeline", {})
     nms_config = {
         "enable_nms": pipeline_dict.get("enable_nms", True),
@@ -400,6 +453,16 @@ def process_and_save(
     result = pipeline.run(image, nms_config=nms_config)
     
     LOGGER.info(f"Generated {len(result.masks)} masks")
+    
+    # 后处理masks
+    kernel_size = pipeline_dict.get("kernel_size", 7)
+    processed_masks = []
+    for mask in result.masks:
+        processed_mask = postprocess_mask(mask, kernel_size=kernel_size)
+        processed_masks.append(processed_mask)
+    
+    result.masks = processed_masks
+    LOGGER.info(f"Applied morphological post-processing (kernel_size={kernel_size})")
     
     # 可视化中间过程
     if visualize_intermediate:
@@ -427,7 +490,6 @@ def process_and_save(
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create overlay
         combined = np.zeros_like(image)
         for idx, mask in enumerate(result.masks):
             color = np.array([
@@ -470,21 +532,17 @@ def main() -> int:
         LOGGER.info(f"Input: {args.input}")
         LOGGER.info(f"Output: {args.output}")
         
-        # Load configuration
         LOGGER.info(f"Loading config from: {args.config}")
         config = load_configs(args.config, getattr(args, "prompt_config", None))
         LOGGER.info("✓ Configuration loaded")
         
-        # Build pipeline
         LOGGER.info("Building pipeline...")
         pipeline = build_pipeline(config)
         LOGGER.info("✓ Pipeline ready")
         
-        # Create output directory
         output_dir = ensure_directory(args.output)
         LOGGER.info(f"Output directory: {output_dir}")
         
-        # Check if intermediate visualization is requested
         visualize_intermediate = getattr(args, "visualize_intermediate", False)
         if visualize_intermediate:
             LOGGER.info("✓ Intermediate visualization enabled")
@@ -492,7 +550,6 @@ def main() -> int:
         processed = 0
         
         if args.mode == "image":
-            # Single image
             LOGGER.info(f"Processing image: {args.input}")
             sample = load_image(args.input)
             stem = Path(args.input).stem
@@ -506,7 +563,6 @@ def main() -> int:
             processed = 1
             
         elif args.mode == "directory":
-            # Directory of images
             LOGGER.info(f"Processing directory: {args.input}")
             
             for sample in stream_directory_images(args.input):
@@ -521,7 +577,6 @@ def main() -> int:
                 processed += 1
             
         elif args.mode == "video":
-            # Video file
             LOGGER.info(f"Processing video: {args.input}")
             
             frames = load_video_frames(
@@ -541,7 +596,6 @@ def main() -> int:
                 processed += 1
             
         elif args.mode == "vkitti":
-            # VKITTI dataset
             LOGGER.info(f"Processing VKITTI2: {args.input}")
             
             vkitti_filter = VkittiFilter(
@@ -578,6 +632,5 @@ def main() -> int:
         return 1
 
 
-# 关键修改：添加模块执行入口
 if __name__ == "__main__":
     sys.exit(main())

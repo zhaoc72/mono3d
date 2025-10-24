@@ -16,6 +16,7 @@ from .prompt_generator import (
     labels_to_regions,
     expand_region_instances,
     proposals_to_prompts,
+    smart_cluster,
 )
 from .sam2_segmenter import SAM2Segmenter, Sam2Config
 from .mask_postprocess import nms_with_objectness, filter_by_combined_score
@@ -24,6 +25,7 @@ from .graph_clustering import GraphClusterer, GraphClusterConfig, merge_small_cl
 from .density_clustering import DensityClusterer, DensityClusterConfig, handle_noise_points
 from .crf_refinement import CRFRefiner, CRFConfig, bilateral_filter_mask
 from .utils import LOGGER
+
 
 
 @dataclass
@@ -94,13 +96,16 @@ class ZeroShotSegmentationPipeline:
         
         self.crf_refiner = CRFRefiner(self.config.crf)
 
-    def _cluster_basic(self, patch_map: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """基础 KMeans 聚类"""
+    def _cluster_basic(self, patch_map: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+        """基础聚类（支持自适应）"""
         grid_h, grid_w, _ = patch_map.shape
         features = patch_map.reshape(-1, patch_map.shape[-1])
-        labels, centroids = kmeans_cluster(features, self.config.cluster)
+        
+        # 使用智能聚类
+        labels, centroids, num_clusters = smart_cluster(features, self.config.cluster)
+        
         label_map = labels.reshape(grid_h, grid_w)
-        return label_map, centroids
+        return label_map, centroids, num_clusters
     
     def _cluster_with_superpixels(
         self,
@@ -135,12 +140,8 @@ class ZeroShotSegmentationPipeline:
             cluster_labels = self.density_clusterer.cluster(superpixel_features)
             cluster_labels = handle_noise_points(cluster_labels, superpixel_features)
         else:
-            # 普通 KMeans
-            from .prompt_generator import kmeans_cluster
-            cluster_labels, centroids = kmeans_cluster(
-                superpixel_features,
-                self.config.cluster
-            )
+            # 使用智能聚类
+            cluster_labels, _, _ = smart_cluster(superpixel_features, self.config.cluster)
         
         # 将聚类标签映射回像素级
         height, width = image.shape[:2]
@@ -213,13 +214,6 @@ class ZeroShotSegmentationPipeline:
     ) -> PipelineResult:
         """
         运行完整的分割 pipeline
-        
-        Args:
-            image: RGB 图像 [H, W, 3]
-            nms_config: NMS 配置（可选）
-            
-        Returns:
-            PipelineResult 包含掩码和中间结果
         """
         # 提取多层融合特征
         LOGGER.info("Extracting DINOv3 features...")
@@ -238,8 +232,11 @@ class ZeroShotSegmentationPipeline:
             label_map, centroids, superpixel_labels = self._cluster_with_superpixels(
                 image, patch_map
             )
+            num_clusters = len(np.unique(label_map))
         else:
-            label_map, centroids = self._cluster_basic(patch_map)
+            label_map, centroids, num_clusters = self._cluster_basic(patch_map)
+        
+        LOGGER.info(f"Clustering result: {num_clusters} clusters")
         
         # 生成候选区域
         LOGGER.info("Generating region proposals...")

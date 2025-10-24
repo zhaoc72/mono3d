@@ -19,6 +19,9 @@ class Sam2Config:
     load_in_8bit: bool = False
     max_batch_size: int = 32
     backend: str = "official"
+    
+    # 新增：mask选择策略
+    mask_selection_strategy: str = "best_balanced"  # best_score, best_balanced, largest
 
 
 class SAM2Segmenter:
@@ -60,12 +63,9 @@ class SAM2Segmenter:
             self.config.model_config,
         )
         
-        import os
         from pathlib import Path
         
-        # Method 1: Try to use build_sam2 with proper Hydra initialization
         try:
-            # Find the sam2 package location
             import sam2
             sam2_package_path = Path(sam2.__file__).parent
             config_dir = sam2_package_path / "configs"
@@ -76,17 +76,13 @@ class SAM2Segmenter:
             if not config_dir.exists():
                 raise FileNotFoundError(f"SAM2 configs directory not found at {config_dir}")
             
-            # Initialize Hydra with the correct config path
-            from hydra import compose, initialize_config_dir
+            from hydra import initialize_config_dir
             from hydra.core.global_hydra import GlobalHydra
             
-            # Clear any existing Hydra instance
             if GlobalHydra.instance().is_initialized():
                 GlobalHydra.instance().clear()
             
-            # Initialize with SAM2's config directory
             with initialize_config_dir(config_dir=str(config_dir), version_base=None):
-                # Now build_sam2 should work
                 sam2_model = build_sam2(
                     self.config.model_config, 
                     self.config.checkpoint_path, 
@@ -99,14 +95,12 @@ class SAM2Segmenter:
             LOGGER.warning(f"Failed to load with Hydra initialization: {e}")
             LOGGER.info("Attempting alternative loading method...")
             
-            # Method 2: Load config manually and build model directly
             try:
                 import yaml
                 import sam2
                 from hydra.utils import instantiate
                 from omegaconf import OmegaConf
                 
-                # Find config file
                 sam2_package_path = Path(sam2.__file__).parent
                 config_path = sam2_package_path / "configs" / f"{self.config.model_config}.yaml"
                 
@@ -115,27 +109,20 @@ class SAM2Segmenter:
                 
                 LOGGER.info(f"Loading config from: {config_path}")
                 
-                # Load the YAML config
                 with open(config_path, 'r') as f:
                     cfg_dict = yaml.safe_load(f)
                 
-                # Convert to OmegaConf
                 cfg = OmegaConf.create(cfg_dict)
-                
-                # Instantiate the model using the config
                 sam2_model = instantiate(cfg, _recursive_=False)
                 
-                # Load checkpoint
                 LOGGER.info(f"Loading checkpoint: {self.config.checkpoint_path}")
                 checkpoint = torch.load(self.config.checkpoint_path, map_location="cpu")
                 
-                # Handle different checkpoint formats
                 if "model" in checkpoint:
                     state_dict = checkpoint["model"]
                 else:
                     state_dict = checkpoint
                 
-                # Load state dict
                 missing_keys, unexpected_keys = sam2_model.load_state_dict(state_dict, strict=False)
                 
                 if missing_keys:
@@ -143,7 +130,6 @@ class SAM2Segmenter:
                 if unexpected_keys:
                     LOGGER.warning(f"Unexpected keys: {unexpected_keys[:5]}...")
                 
-                # Move to device
                 sam2_model = sam2_model.to(self.device)
                 
                 LOGGER.info("✅ Successfully loaded SAM2 model using manual config loading")
@@ -156,7 +142,6 @@ class SAM2Segmenter:
                     f"Checkpoint: {self.config.checkpoint_path}"
                 ) from e2
         
-        # Create predictor
         self.predictor = SAM2ImagePredictor(sam2_model, device=self.device)
         self.model = sam2_model
         self.processor = None
@@ -206,6 +191,69 @@ class SAM2Segmenter:
         inputs = self.processor(**kwargs)
         return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
 
+    def _select_best_mask(
+        self,
+        masks: np.ndarray,
+        scores: np.ndarray,
+        strategy: str = "best_balanced"
+    ) -> np.ndarray:
+        """
+        从多个候选mask中选择最佳mask
+        
+        Args:
+            masks: [N, H, W] 候选masks
+            scores: [N] 对应的scores
+            strategy: 选择策略
+                - "best_score": 直接选得分最高的
+                - "best_balanced": 得分高且面积适中的
+                - "largest": 面积最大的
+        
+        Returns:
+            选中的mask [H, W]
+        """
+        if len(masks) == 1:
+            return masks[0]
+        
+        if strategy == "best_score":
+            best_idx = int(np.argmax(scores))
+            return masks[best_idx]
+        
+        elif strategy == "largest":
+            areas = [m.sum() for m in masks]
+            best_idx = int(np.argmax(areas))
+            return masks[best_idx]
+        
+        elif strategy == "best_balanced":
+            # 综合考虑得分和面积
+            areas = np.array([m.sum() for m in masks])
+            
+            # 过滤面积异常的mask
+            if len(areas) > 1:
+                mean_area = np.mean(areas)
+                std_area = np.std(areas)
+                
+                # 计算综合分数
+                combined_scores = []
+                for i, (area, score) in enumerate(zip(areas, scores)):
+                    # 面积惩罚：离平均值越远，惩罚越大
+                    area_penalty = abs(area - mean_area) / (std_area + 1e-6)
+                    area_penalty = np.clip(area_penalty, 0, 2)
+                    
+                    # 综合分数 = 置信度分数 - 面积惩罚
+                    combined_score = score - 0.3 * area_penalty
+                    combined_scores.append(combined_score)
+                
+                best_idx = int(np.argmax(combined_scores))
+            else:
+                best_idx = int(np.argmax(scores))
+            
+            return masks[best_idx]
+        
+        else:
+            # 默认策略
+            best_idx = int(np.argmax(scores))
+            return masks[best_idx]
+
     def _segment_huggingface(
         self,
         image: np.ndarray,
@@ -237,8 +285,12 @@ class SAM2Segmenter:
                 mask_np = mask_np[:, 0]
             if mask_np.ndim == 3 and mask_np.shape[0] > 1 and iou_scores is not None:
                 scores = iou_scores[idx].cpu().numpy().reshape(-1)
-                best_idx = int(scores.argmax())
-                masks.append(mask_np[best_idx])
+                best_mask = self._select_best_mask(
+                    mask_np,
+                    scores,
+                    strategy=self.config.mask_selection_strategy
+                )
+                masks.append(best_mask)
             elif mask_np.ndim == 3:
                 masks.append(mask_np[0])
             elif mask_np.ndim == 2:
@@ -275,16 +327,12 @@ class SAM2Segmenter:
         if self.predictor is None:
             raise RuntimeError("Official SAM2 backend is not initialized")
         
-        # Ensure image is in the correct format
         rgb_image = image
         if rgb_image.dtype != np.uint8:
             rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
         
-        # Convert RGB to BGR for SAM2
-        # IMPORTANT: Use copy() to avoid negative strides
         bgr_image = rgb_image[:, :, ::-1].copy()
         
-        # Set the image
         self.predictor.set_image(bgr_image)
 
         num_prompts = 0
@@ -309,11 +357,17 @@ class SAM2Segmenter:
                 scores = scores.cpu().numpy()
             if masks.ndim == 4:
                 masks = masks[:, 0]
+            
+            # 使用改进的mask选择策略
             if scores is not None and len(scores) > 0:
-                best = int(np.argmax(scores))
-                mask = masks[best]
+                mask = self._select_best_mask(
+                    masks,
+                    scores,
+                    strategy=self.config.mask_selection_strategy
+                )
             else:
                 mask = masks[0]
+            
             results.append(mask.astype(np.uint8))
         return results
 
@@ -354,5 +408,4 @@ class SAM2Segmenter:
                 offset += len(chunk_boxes)
             return batched_masks
 
-        # Official backend processes prompts sequentially
         return self.segment(image, boxes=boxes, points=points, labels=labels)
