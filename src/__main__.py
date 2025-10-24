@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Command-line interface for the zero-shot segmentation pipeline."""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+
+from .data_loader import load_image, load_video_frames, stream_directory_images
+from .datasets.vkitti import VkittiFilter, iter_vkitti_frames
+from .dinov3_feature import DINOv3FeatureExtractor, Dinov3Config
+from .inference_pipeline import PipelineConfig, ZeroShotSegmentationPipeline
+from .prompt_generator import ClusterConfig, PromptConfig
+from .sam2_segmenter import SAM2Segmenter, Sam2Config
+from .superpixel_helper import SuperpixelConfig
+from .graph_clustering import GraphClusterConfig
+from .density_clustering import DensityClusterConfig
+from .crf_refinement import CRFConfig
+from .utils import ensure_directory, load_yaml, save_mask, setup_logging, to_torch_dtype, LOGGER
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Zero-shot instance segmentation using DINOv3 + SAM2"
+    )
+    
+    subparsers = parser.add_subparsers(dest="mode", help="Inference mode")
+    
+    # Image mode
+    image_parser = subparsers.add_parser("image", help="Process a single image")
+    image_parser.add_argument("--input", required=True, help="Path to input image")
+    image_parser.add_argument("--output", required=True, help="Output directory")
+    image_parser.add_argument("--config", required=True, help="Model config YAML")
+    image_parser.add_argument("--prompt-config", help="Prompt config YAML")
+    
+    # Directory mode
+    dir_parser = subparsers.add_parser("directory", help="Process a directory of images")
+    dir_parser.add_argument("--input", required=True, help="Input directory")
+    dir_parser.add_argument("--output", required=True, help="Output directory")
+    dir_parser.add_argument("--config", required=True, help="Model config YAML")
+    dir_parser.add_argument("--prompt-config", help="Prompt config YAML")
+    
+    # Video mode
+    video_parser = subparsers.add_parser("video", help="Process a video file")
+    video_parser.add_argument("--input", required=True, help="Path to video file")
+    video_parser.add_argument("--output", required=True, help="Output directory")
+    video_parser.add_argument("--config", required=True, help="Model config YAML")
+    video_parser.add_argument("--prompt-config", help="Prompt config YAML")
+    video_parser.add_argument("--frame-skip", type=int, default=1, help="Frame sampling interval")
+    
+    # VKITTI mode
+    vkitti_parser = subparsers.add_parser("vkitti", help="Process Virtual KITTI 2 dataset")
+    vkitti_parser.add_argument("--input", required=True, help="VKITTI2 root directory")
+    vkitti_parser.add_argument("--output", required=True, help="Output directory")
+    vkitti_parser.add_argument("--config", required=True, help="Model config YAML")
+    vkitti_parser.add_argument("--prompt-config", help="Prompt config YAML")
+    vkitti_parser.add_argument("--vkitti-scenes", nargs="+", help="Scene names to process")
+    vkitti_parser.add_argument("--vkitti-clones", nargs="+", help="Clone names to process")
+    vkitti_parser.add_argument("--vkitti-camera", default="Camera_0", help="Camera name")
+    vkitti_parser.add_argument("--vkitti-limit", type=int, help="Max frames to process")
+    
+    return parser.parse_args()
+
+
+def load_configs(config_path: str, prompt_config_path: Optional[str] = None) -> dict:
+    """Load configuration files."""
+    config = load_yaml(config_path)
+    
+    if prompt_config_path:
+        prompt_config = load_yaml(prompt_config_path)
+        config.setdefault("prompt", {}).update(prompt_config)
+    
+    return config
+
+
+def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
+    """Build the segmentation pipeline from configuration."""
+    device = config.get("device", "cuda")
+    dtype = to_torch_dtype(config.get("dtype", "float32"))
+    
+    # DINOv3 config
+    dinov3_cfg = Dinov3Config(**config["dinov3"])
+    
+    # SAM2 config
+    sam2_cfg = Sam2Config(**config["sam2"])
+    
+    # Pipeline config
+    pipeline_dict = config.get("pipeline", {})
+    
+    cluster_cfg = ClusterConfig(**pipeline_dict.get("cluster", {}))
+    prompt_cfg = PromptConfig(**pipeline_dict.get("prompt", {}))
+    
+    superpixel_cfg = SuperpixelConfig(**pipeline_dict.get("superpixel", {}))
+    graph_cluster_cfg = GraphClusterConfig(**pipeline_dict.get("graph_cluster", {}))
+    density_cluster_cfg = DensityClusterConfig(**pipeline_dict.get("density_cluster", {}))
+    crf_cfg = CRFConfig(**pipeline_dict.get("crf", {}))
+    
+    pipeline_cfg = PipelineConfig(
+        cluster=cluster_cfg,
+        prompt=prompt_cfg,
+        use_superpixels=pipeline_dict.get("use_superpixels", False),
+        superpixel=superpixel_cfg,
+        use_graph_clustering=pipeline_dict.get("use_graph_clustering", False),
+        graph_cluster=graph_cluster_cfg,
+        use_density_clustering=pipeline_dict.get("use_density_clustering", False),
+        density_cluster=density_cluster_cfg,
+        crf=crf_cfg,
+    )
+    
+    # Initialize models
+    extractor = DINOv3FeatureExtractor(dinov3_cfg, device, dtype)
+    segmenter = SAM2Segmenter(sam2_cfg, device, dtype)
+    
+    return ZeroShotSegmentationPipeline(
+        dinov3_cfg,
+        sam2_cfg,
+        pipeline_cfg,
+        device=device,
+        dtype=dtype,
+        extractor=extractor,
+        segmenter=segmenter,
+    )
+
+
+def process_and_save(
+    pipeline: ZeroShotSegmentationPipeline,
+    image: np.ndarray,
+    output_dir: Path,
+    stem: str,
+    config: dict,
+    save_viz: bool = True,
+) -> int:
+    """Process an image and save results."""
+    # NMS config
+    pipeline_dict = config.get("pipeline", {})
+    nms_config = {
+        "enable_nms": pipeline_dict.get("enable_nms", True),
+        "iou_threshold": pipeline_dict.get("iou_threshold", 0.6),
+        "objectness_weight": pipeline_dict.get("objectness_weight", 0.5),
+        "confidence_weight": pipeline_dict.get("confidence_weight", 0.3),
+        "area_weight": pipeline_dict.get("area_weight", 0.2),
+    }
+    
+    # Run pipeline
+    result = pipeline.run(image, nms_config=nms_config)
+    
+    # Save masks
+    mask_dir = output_dir / "masks" / stem
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    
+    mask_format = pipeline_dict.get("output_mask_format", "png")
+    area_threshold = pipeline_dict.get("area_threshold", 100)
+    
+    valid_count = 0
+    for idx, mask in enumerate(result.masks):
+        area = int(mask.astype(np.uint8).sum())
+        if area >= area_threshold:
+            mask_path = mask_dir / f"mask_{idx:03d}.{mask_format}"
+            save_mask(mask_path, mask, format_hint=mask_format)
+            valid_count += 1
+    
+    # Save visualization
+    if save_viz and pipeline_dict.get("save_visualization", True):
+        viz_dir = output_dir / "visualizations"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create overlay
+        combined = np.zeros_like(image)
+        for idx, mask in enumerate(result.masks):
+            color = np.array([
+                (idx * 50) % 255,
+                (idx * 80 + 60) % 255,
+                (idx * 120 + 30) % 255,
+            ], dtype=np.uint8)
+            combined[mask.astype(bool)] = color
+        
+        alpha = pipeline_dict.get("visualization_alpha", 0.5)
+        overlay = cv2.addWeighted(
+            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+            1 - alpha,
+            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR),
+            alpha,
+            0,
+        )
+        
+        viz_path = viz_dir / f"{stem}_overlay.png"
+        cv2.imwrite(str(viz_path), overlay)
+    
+    return valid_count
+
+
+def main() -> int:
+    """Main entry point."""
+    args = parse_args()
+    
+    if args.mode is None:
+        print("Error: Please specify a mode (image, directory, video, or vkitti)")
+        return 1
+    
+    setup_logging()
+    
+    # Load configuration
+    config = load_configs(args.config, getattr(args, "prompt_config", None))
+    
+    # Build pipeline
+    LOGGER.info("Building pipeline...")
+    pipeline = build_pipeline(config)
+    LOGGER.info("Pipeline ready")
+    
+    # Create output directory
+    output_dir = ensure_directory(args.output)
+    
+    processed = 0
+    
+    if args.mode == "image":
+        # Single image
+        LOGGER.info(f"Processing image: {args.input}")
+        sample = load_image(args.input)
+        stem = Path(args.input).stem
+        
+        valid_count = process_and_save(
+            pipeline, sample.image, output_dir, stem, config
+        )
+        
+        LOGGER.info(f"Saved {valid_count} masks to {output_dir / 'masks' / stem}")
+        processed = 1
+        
+    elif args.mode == "directory":
+        # Directory of images
+        LOGGER.info(f"Processing directory: {args.input}")
+        
+        for sample in stream_directory_images(args.input):
+            stem = Path(sample.path).stem
+            LOGGER.info(f"Processing: {stem}")
+            
+            valid_count = process_and_save(
+                pipeline, sample.image, output_dir, stem, config
+            )
+            
+            LOGGER.info(f"  → {valid_count} valid masks")
+            processed += 1
+        
+    elif args.mode == "video":
+        # Video file
+        LOGGER.info(f"Processing video: {args.input}")
+        
+        frames = load_video_frames(
+            args.input,
+            frame_skip=args.frame_skip,
+        )
+        
+        for idx, sample in enumerate(frames):
+            stem = f"frame_{idx:06d}"
+            LOGGER.info(f"Processing: {stem}")
+            
+            valid_count = process_and_save(
+                pipeline, sample.image, output_dir, stem, config
+            )
+            
+            LOGGER.info(f"  → {valid_count} valid masks")
+            processed += 1
+        
+    elif args.mode == "vkitti":
+        # VKITTI dataset
+        LOGGER.info(f"Processing VKITTI2: {args.input}")
+        
+        vkitti_filter = VkittiFilter(
+            scenes=args.vkitti_scenes,
+            clones=args.vkitti_clones,
+            camera=args.vkitti_camera,
+            limit=args.vkitti_limit,
+        )
+        
+        for sample in iter_vkitti_frames(args.input, filter=vkitti_filter):
+            meta = sample.metadata
+            stem = f"{meta['scene']}_{meta['clone']}_{meta['frame']}"
+            
+            LOGGER.info(f"Processing: {stem}")
+            
+            valid_count = process_and_save(
+                pipeline, sample.image, output_dir, stem, config
+            )
+            
+            LOGGER.info(f"  → {valid_count} valid masks")
+            processed += 1
+    
+    LOGGER.info(f"Processing complete: {processed} images")
+    LOGGER.info(f"Output directory: {output_dir}")
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
