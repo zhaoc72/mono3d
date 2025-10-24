@@ -71,12 +71,9 @@ def load_configs(config_path: str, prompt_config_path: Optional[str] = None) -> 
     """Load configuration files."""
     config = load_yaml(config_path)
     
-    # prompt_config.yaml 中的配置不直接用于初始化
-    # 它们是运行时参数，在这里只是加载并存储到 config 中
     if prompt_config_path:
         prompt_config = load_yaml(prompt_config_path)
-        # 将 prompt_config 存储为单独的键，不合并到 prompt 中
-        config["prompt_config_yaml"] = prompt_config
+        config.setdefault("prompt", {}).update(prompt_config)
     
     return config
 
@@ -100,16 +97,7 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
     pipeline_dict = config.get("pipeline", {})
     
     cluster_cfg = ClusterConfig(**pipeline_dict.get("cluster", {}))
-    
-    # PromptConfig - 只使用它支持的参数
-    prompt_dict = pipeline_dict.get("prompt", {})
-    prompt_cfg = PromptConfig(
-        include_boxes=prompt_dict.get("include_boxes", True),
-        include_points=prompt_dict.get("include_points", True),
-        point_strategy=prompt_dict.get("point_strategy", "density"),
-        max_points_per_region=prompt_dict.get("max_points_per_region", 5),
-        density_noise_handling=prompt_dict.get("density_noise_handling", "nearest"),
-    )
+    prompt_cfg = PromptConfig(**pipeline_dict.get("prompt", {}))
     
     superpixel_cfg = SuperpixelConfig(**pipeline_dict.get("superpixel", {}))
     graph_cluster_cfg = GraphClusterConfig(**pipeline_dict.get("graph_cluster", {}))
