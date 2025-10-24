@@ -7,12 +7,13 @@ dinov3:
   use_torch_hub: true
   torchhub_source: "local"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vith16plus.pth"
-  
-  output_layers: [8, 12]
-  layer_weights: [0.4, 0.6]
-  fusion_method: "weighted_sum"
-  
-  enable_pca: false
+
+  output_layers: [4, 8, 12]
+  layer_weights: [0.2, 0.3, 0.5]
+  fusion_method: "weighted_concat"
+
+  enable_pca: true
+  pca_dim: 32
   enable_objectness: true
 
 sam2:
@@ -27,65 +28,112 @@ sam2:
 
 pipeline:
   area_threshold: 100
-  kernel_size: 7
-  dilation_radius: 5
-  
+  kernel_size: 9
+  dilation_radius: 3
+
   output_mask_format: "png"
   save_visualization: true
   visualization_alpha: 0.5
-  
+
   enable_nms: true
   iou_threshold: 0.5
-  objectness_weight: 0.3
-  confidence_weight: 0.4
-  area_weight: 0.3
+  objectness_weight: 0.7
+  confidence_weight: 0.2
+  area_weight: 0.1
+  min_mask_objectness: 0.45
+  min_mask_area: 150
   
-  use_superpixels: false
+  use_superpixels: true
+  auto_superpixel:
+    enable: true
+    min_proposals: 6
+    min_clusters: 6
+    max_mean_area_ratio: 0.3
+    max_single_area_ratio: 0.6
+    log_top_k: 5
   use_graph_clustering: false
-  use_density_clustering: false
+  use_density_clustering: true
+  density_cluster:
+    method: "hdbscan"
+    min_cluster_size: 45
+    min_samples: 6
+    cluster_selection_epsilon: 0.0
   
   crf:
     enable: true
-    max_iterations: 10
-    pos_w: 3.0
-    pos_xy_std: 3.0
-    bi_w: 10.0
-    bi_xy_std: 50.0
-    bi_rgb_std: 5.0
+    max_iterations: 12
+    pos_w: 4.0
+    pos_xy_std: 3.5
+    bi_w: 12.0
+    bi_xy_std: 80.0
+    bi_rgb_std: 4.0
   
   cluster:
     # ===== 自适应聚类配置 =====
-    clustering_method: "adaptive"  # fixed, adaptive, hdbscan, meanshift
+    clustering_method: "hdbscan"  # fixed, adaptive, hdbscan, meanshift
     
     # Fixed方法参数（仅当clustering_method="fixed"时使用）
     num_clusters: 6
     
     # Adaptive方法参数
-    min_clusters: 3       # 最小聚类数
-    max_clusters: 15      # 最大聚类数
+    min_clusters: 6       # 最小聚类数
+    max_clusters: 30      # 最大聚类数
     cluster_selection_method: "silhouette"  # elbow, silhouette
     
     # 通用参数
-    max_iterations: 30
+    max_iterations: 40
     random_state: 0
-    min_region_area: 200
-    max_regions: 20
-    min_instance_area: 200
-    
-    use_objectness_filter: false
-    objectness_threshold: 0.3
-    objectness_weight: 0.5
-    
+    min_region_area: 100
+    max_regions: 40
+    min_instance_area: 60
+    enable_instance_split: true
+    max_instances_per_cluster: 12
+
+    use_objectness_filter: true
+    objectness_threshold: 0.45
+    objectness_weight: 0.7
+    apply_objectness_mask: true
+    objectness_mask_threshold: 0.45
+    objectness_min_keep_patches: 96
+
     use_connected_components: true
-    min_component_area: 150
-    
+    min_component_area: 80
+    foreground_only: true
+    max_background_ratio: 0.8
+    merge_small_clusters: true
+    min_cluster_size: 72
+    merge_similar_clusters: true
+    similarity_threshold: 0.9
+    min_similarity_cluster_size: 200
+    merge_edge_background: true
+    edge_background_area_ratio: 0.18
+    edge_touch_ratio: 0.32
+
+  proposal_refine:
+    enable: true
+    closing_kernel: 5
+    opening_kernel: 3
+    blur_sigma: 1.5
+    blur_threshold: 0.45
+    min_keep_area: 120
+
   prompt:
     include_boxes: true
     include_points: true
+    include_masks: true
+    include_heatmaps: false
+    heatmap_weight: 0.4
     point_strategy: "density"
-    max_points_per_region: 5
+    max_points_per_region: 9
+    min_positive_points: 3
+    fallback_point_strategy: "grid"
     density_noise_handling: "nearest"
     grid_points_per_side: 3
+    log_top_k: 5
+    mask_gaussian_sigma: 1.5
+    density_cluster:
+      method: "meanshift"
+      bandwidth: 0.7
 
 reconstruction:
   output_directory: "outputs/recon_inputs"

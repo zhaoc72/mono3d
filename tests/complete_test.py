@@ -221,7 +221,12 @@ def main():
     print("步骤 6: 生成候选区域")
     print("=" * 80)
     
-    proposals = labels_to_regions(label_map, image.shape[:2], cluster_cfg)
+    proposals = labels_to_regions(
+        label_map,
+        image.shape[:2],
+        cluster_cfg,
+        patch_shape=label_map.shape,
+    )
 
     print(f"✅ 候选区域生成完成")
     print(f"   候选数: {len(proposals)}")

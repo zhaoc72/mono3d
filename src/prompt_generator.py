@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+try:  # pragma: no cover - optional dependency in tests
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None  # type: ignore
 
 import numpy as np
 from PIL import Image
@@ -31,11 +36,32 @@ class ClusterConfig:
     min_region_area: int = 800
     max_regions: int = 20
     min_instance_area: int = 400
+    enable_instance_split: bool = True
+    max_instances_per_cluster: int = 8
+
+    # 背景抑制
+    foreground_only: bool = True
+    max_background_ratio: float = 0.85
+
+    # 聚类后处理
+    merge_small_clusters: bool = True
+    min_cluster_size: int = 80
+    merge_similar_clusters: bool = True
+    similarity_threshold: float = 0.92
+    min_similarity_cluster_size: int = 0
+
+    # 背景合并
+    merge_edge_background: bool = False
+    edge_background_area_ratio: float = 0.12
+    edge_touch_ratio: float = 0.25
 
     # 对象性筛选配置
     use_objectness_filter: bool = True
     objectness_threshold: float = 0.3
     objectness_weight: float = 0.5
+    apply_objectness_mask: bool = False
+    objectness_mask_threshold: Optional[float] = None
+    objectness_min_keep_patches: int = 64
     
     # 连通域配置
     use_connected_components: bool = True
@@ -48,15 +74,22 @@ class PromptConfig:
 
     include_boxes: bool = True
     include_points: bool = True
+    include_masks: bool = True
+    include_heatmaps: bool = False
+    heatmap_weight: float = 0.4
     point_strategy: str = "density"  # centroid, density, grid
-    max_points_per_region: int = 5
+    max_points_per_region: int = 7
+    min_positive_points: int = 3
+    fallback_point_strategy: str = "grid"  # grid, centroid
     density_noise_handling: str = "nearest"
     density_cluster: DensityClusterConfig = field(
         default_factory=lambda: DensityClusterConfig(method="meanshift")
     )
-    
+
     # grid点策略配置
     grid_points_per_side: int = 3
+    log_top_k: int = 5
+    mask_gaussian_sigma: float = 0.0
 
 
 @dataclass
@@ -394,6 +427,95 @@ def _resize_label_map(label_map: np.ndarray, width: int, height: int) -> np.ndar
     return np.array(resized, dtype=np.int32)
 
 
+def _mask_to_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0, 0, 0, 0
+    x0, x1 = int(xs.min()), int(xs.max() + 1)
+    y0, y1 = int(ys.min()), int(ys.max() + 1)
+    return x0, y0, x1, y1
+
+
+def _mask_centroid(mask: np.ndarray) -> Tuple[int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0, 0
+    cx = int(np.round(xs.mean()))
+    cy = int(np.round(ys.mean()))
+    return cx, cy
+
+
+def _border_touch_ratio(mask: np.ndarray) -> float:
+    """Compute the fraction of mask pixels touching the image border."""
+
+    area = float(mask.sum())
+    if area <= 0:
+        return 0.0
+
+    top = float(mask[0, :].sum())
+    bottom = float(mask[-1, :].sum())
+    left = float(mask[:, 0].sum())
+    right = float(mask[:, -1].sum())
+    border_hits = top + bottom + left + right
+
+    # 边角像素可能重复统计，但只作为近似度量
+    return border_hits / max(area, 1.0)
+
+
+def _deduplicate_points(points: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    unique: List[Tuple[int, int]] = []
+    seen = set()
+    for point in points:
+        if point in seen:
+            continue
+        seen.add(point)
+        unique.append(point)
+    return unique
+
+
+def _augment_points(
+    points: List[Tuple[int, int]],
+    proposal: "RegionProposal",
+    config: PromptConfig,
+) -> List[Tuple[int, int]]:
+    desired = max(1, config.min_positive_points)
+    if len(points) >= desired:
+        return points[:desired]
+
+    augmented = list(points)
+    seen = set(points)
+
+    candidates: Iterable[Tuple[int, int]] = []
+    if config.fallback_point_strategy == "grid":
+        grid = _generate_grid_points(
+            proposal.bbox,
+            proposal.mask,
+            points_per_side=max(2, config.grid_points_per_side),
+        )
+        candidates = grid
+    elif config.fallback_point_strategy == "centroid":
+        candidates = [proposal.centroid]
+
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        x, y = candidate
+        if 0 <= y < proposal.mask.shape[0] and 0 <= x < proposal.mask.shape[1]:
+            if proposal.mask[y, x] > 0:
+                augmented.append(candidate)
+                seen.add(candidate)
+        if len(augmented) >= desired:
+            break
+
+    if not augmented:
+        augmented = [proposal.centroid]
+
+    while len(augmented) < desired:
+        augmented.append(proposal.centroid)
+
+    return augmented[:desired]
+
+
 def _patch_coords_to_mask(
     patch_coords: np.ndarray,
     grid_shape: Tuple[int, int],
@@ -436,11 +558,18 @@ def _extract_connected_components(
     """
     try:
         from scipy.ndimage import label as connected_components
+        labeled, num_components = connected_components(mask)
     except ImportError:
-        # 如果没有scipy，返回原mask
-        return [(mask, int(mask.sum()))]
-    
-    labeled, num_components = connected_components(mask)
+        if cv2 is None:
+            return [(mask.astype(np.uint8), int(mask.sum()))]
+        mask_uint8 = mask.astype(np.uint8)
+        num_components, labeled = cv2.connectedComponents(mask_uint8, connectivity=8)
+        num_components -= 1  # cv2 includes background label 0
+        if num_components <= 0:
+            return [(mask, int(mask.sum()))]
+        labeled = labeled.astype(np.int32)
+        # shift labels so background is 0, foreground starts from 1
+        labeled[labeled > 0] += 0
     
     components = []
     for component_id in range(1, num_components + 1):
@@ -465,12 +594,20 @@ def _density_cluster_instances(
 ) -> List[InstanceSeed]:
     """Split a semantic region into instance seeds via density clustering."""
 
+    if not getattr(cluster_config, "enable_instance_split", True):
+        return []
+
     if patch_map is None or proposal.patch_coords is None or len(proposal.patch_coords) == 0:
         return []
 
     features = patch_map[proposal.patch_coords[:, 0], proposal.patch_coords[:, 1]]
     if features.ndim != 2 or len(features) < 2:
         return []
+
+    features = np.asarray(features, dtype=np.float32)
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    features = features / norms
 
     clusterer = DensityClusterer(prompt_config.density_cluster)
     try:
@@ -521,10 +658,63 @@ def _density_cluster_instances(
         )
 
     seeds.sort(key=lambda seed: seed.area, reverse=True)
-    if prompt_config.max_points_per_region > 0:
-        seeds = seeds[: prompt_config.max_points_per_region]
+
+    max_instances = getattr(cluster_config, "max_instances_per_cluster", 0)
+    if max_instances > 0:
+        seeds = seeds[: max_instances]
 
     return seeds
+
+
+def _component_patch_coords(
+    component_mask: np.ndarray,
+    label_map: np.ndarray,
+    label_value: int,
+    patch_shape: Tuple[int, int],
+    image_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Project a high-resolution component mask onto the patch grid."""
+
+    patch_h, patch_w = patch_shape
+    height, width = image_shape
+
+    if patch_h <= 0 or patch_w <= 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    ys, xs = np.nonzero(component_mask)
+    if len(xs) == 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    scale_y = height / float(patch_h)
+    scale_x = width / float(patch_w)
+
+    y0_patch = max(0, int(np.floor(ys.min() / scale_y)))
+    y1_patch = min(patch_h, int(np.ceil((ys.max() + 1) / scale_y)))
+    x0_patch = max(0, int(np.floor(xs.min() / scale_x)))
+    x1_patch = min(patch_w, int(np.ceil((xs.max() + 1) / scale_x)))
+
+    coords: List[Tuple[int, int]] = []
+    for py in range(y0_patch, y1_patch):
+        for px in range(x0_patch, x1_patch):
+            if label_map[py, px] != int(label_value):
+                continue
+            py0 = int(np.floor(py * scale_y))
+            py1 = int(np.ceil((py + 1) * scale_y))
+            px0 = int(np.floor(px * scale_x))
+            px1 = int(np.ceil((px + 1) * scale_x))
+
+            py0 = max(0, min(height - 1, py0))
+            py1 = max(py0 + 1, min(height, py1))
+            px0 = max(0, min(width - 1, px0))
+            px1 = max(px0 + 1, min(width, px1))
+
+            if component_mask[py0:py1, px0:px1].any():
+                coords.append((py, px))
+
+    if not coords:
+        return np.empty((0, 2), dtype=np.int32)
+
+    return np.array(coords, dtype=np.int32)
 
 
 def labels_to_regions(
@@ -532,10 +722,9 @@ def labels_to_regions(
     image_shape: Tuple[int, int],
     config: ClusterConfig,
     objectness_map: Optional[np.ndarray] = None,
+    patch_shape: Optional[Tuple[int, int]] = None,
 ) -> List[RegionProposal]:
-    """
-    将聚类标签转换为候选区域，支持连通域分离
-    """
+    """将聚类标签转换为候选区域，支持连通域分离并保留 patch 坐标。"""
     height, width = image_shape
     proposals: List[RegionProposal] = []
     upscale = _resize_label_map(label_map, width, height)
@@ -546,15 +735,28 @@ def labels_to_regions(
         objectness_pil = Image.fromarray((objectness_map * 255).astype(np.uint8), mode="L")
         objectness_resized = objectness_pil.resize((width, height), resample=Image.BILINEAR)
         objectness_upscale = np.array(objectness_resized, dtype=np.float32) / 255.0
-    
+
+    image_area = float(height * width)
+
     for label in np.unique(upscale):
+        if int(label) < 0:
+            continue
         cluster_mask = upscale == int(label)
-        
+
+        cluster_area = float(cluster_mask.sum())
+        if cluster_area <= 0:
+            continue
+
+        if config.merge_edge_background and cluster_area / image_area >= config.edge_background_area_ratio:
+            border_ratio = _border_touch_ratio(cluster_mask)
+            if border_ratio >= config.edge_touch_ratio:
+                continue
+
         # 连通域分析
         if config.use_connected_components:
             components = _extract_connected_components(
                 cluster_mask,
-                min_area=config.min_component_area
+                min_area=min(config.min_component_area, config.min_region_area)
             )
         else:
             # 不分离连通域，整体作为一个候选
@@ -569,16 +771,21 @@ def labels_to_regions(
             # 面积过滤
             if area < config.min_region_area:
                 continue
-            
+
             ys, xs = np.nonzero(mask_bool)
             if len(xs) == 0:
                 continue
-            
+
             x0, x1 = xs.min(), xs.max() + 1
             y0, y1 = ys.min(), ys.max() + 1
             cx = int(np.round(xs.mean()))
             cy = int(np.round(ys.mean()))
-            
+
+            if config.foreground_only:
+                area_ratio = float(area) / float(height * width)
+                if area_ratio >= config.max_background_ratio:
+                    continue
+
             # 计算对象性评分
             objectness_score = 0.0
             if objectness_upscale is not None:
@@ -599,10 +806,19 @@ def labels_to_regions(
                 combined_score = float(area)
             
             # 记录patch坐标
-            patch_mask = label_map == int(label)
             patch_coords = None
-            if np.any(patch_mask):
-                patch_coords = np.column_stack(np.nonzero(patch_mask))
+            if patch_shape is not None:
+                patch_coords = _component_patch_coords(
+                    mask_bool,
+                    label_map,
+                    int(label),
+                    patch_shape,
+                    image_shape,
+                )
+            else:
+                patch_mask = label_map == int(label)
+                if np.any(patch_mask):
+                    patch_coords = np.column_stack(np.nonzero(patch_mask))
 
             proposals.append(
                 RegionProposal(
@@ -634,15 +850,13 @@ def expand_region_instances(
 
     expanded: List[RegionProposal] = []
     for proposal in proposals:
-        seeds: List[InstanceSeed] = []
-        if prompt_config.include_points and prompt_config.point_strategy == "density":
-            seeds = _density_cluster_instances(
-                proposal,
-                patch_map,
-                image_shape,
-                prompt_config,
-                cluster_config,
-            )
+        seeds: List[InstanceSeed] = _density_cluster_instances(
+            proposal,
+            patch_map,
+            image_shape,
+            prompt_config,
+            cluster_config,
+        )
 
         if not seeds:
             fallback_seed = InstanceSeed(
@@ -726,15 +940,10 @@ def _density_seed_points(
     if not seeds:
         return [proposal.centroid]
 
-    unique_points: List[Tuple[int, int]] = []
-    seen = set()
-    for seed in seeds:
-        if seed.point in seen:
-            continue
-        seen.add(seed.point)
-        unique_points.append(seed.point)
+    unique_points = _deduplicate_points(seed.point for seed in seeds)
+    unique_points = _augment_points(unique_points, proposal, config)
 
-    return unique_points or [proposal.centroid]
+    return unique_points
 
 
 def _select_points(
@@ -756,6 +965,11 @@ def _select_points(
                 config,
                 cluster_config or ClusterConfig(),
             )
+        proposal.seed_points = _augment_points(
+            proposal.seed_points,
+            proposal,
+            config,
+        )
         return proposal.seed_points
     
     elif config.point_strategy == "grid":
@@ -768,7 +982,9 @@ def _select_points(
     
     # 默认使用质心
     if not proposal.seed_points:
-        proposal.seed_points = [proposal.centroid]
+        proposal.seed_points = [_mask_centroid(proposal.mask)]
+        proposal.centroid = proposal.seed_points[0]
+    proposal.seed_points = _augment_points(proposal.seed_points, proposal, config)
     return proposal.seed_points
 
 
@@ -783,10 +999,16 @@ def proposals_to_prompts(
     points: List[List[Tuple[int, int]]] = []
     labels: List[List[int]] = []
     for proposal in proposals:
+        bbox = _mask_to_bbox(proposal.mask)
+        proposal.bbox = bbox
+        proposal.centroid = _mask_centroid(proposal.mask)
+
         prompt_points: List[Tuple[int, int]] = []
         point_labels: List[int] = []
-        if config.include_boxes:
-            boxes.append(list(proposal.bbox))
+
+        boxes.append(list(bbox))
+
+        region_points: List[Tuple[int, int]] = []
         if config.include_points:
             region_points = _select_points(
                 proposal,
@@ -797,10 +1019,8 @@ def proposals_to_prompts(
             )
             prompt_points.extend(region_points)
             point_labels.extend([1] * len(region_points))
-        if prompt_points:
-            points.append(prompt_points)
-            labels.append(point_labels)
-        else:
-            points.append([])
-            labels.append([])
+
+        points.append(region_points if region_points else [])
+        labels.append(point_labels if point_labels else [])
+
     return boxes, points, labels

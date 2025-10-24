@@ -13,7 +13,12 @@ import numpy as np
 from .data_loader import load_image, load_video_frames, stream_directory_images
 from .datasets.vkitti import VkittiFilter, iter_vkitti_frames
 from .dinov3_feature import DINOv3FeatureExtractor, Dinov3Config
-from .inference_pipeline import PipelineConfig, ZeroShotSegmentationPipeline
+from .inference_pipeline import (
+    AutoSuperpixelConfig,
+    PipelineConfig,
+    ProposalRefineConfig,
+    ZeroShotSegmentationPipeline,
+)
 from .prompt_generator import ClusterConfig, PromptConfig
 from .sam2_segmenter import SAM2Segmenter, Sam2Config
 from .superpixel_helper import SuperpixelConfig
@@ -100,7 +105,7 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
     cluster_cfg = ClusterConfig(
         # 聚类方法
         clustering_method=cluster_dict.get("clustering_method", "adaptive"),
-        
+
         # Fixed方法参数
         num_clusters=cluster_dict.get("num_clusters", 6),
         
@@ -115,12 +120,27 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
         min_region_area=cluster_dict.get("min_region_area", 200),
         max_regions=cluster_dict.get("max_regions", 20),
         min_instance_area=cluster_dict.get("min_instance_area", 200),
-        
+        enable_instance_split=cluster_dict.get("enable_instance_split", True),
+        max_instances_per_cluster=cluster_dict.get("max_instances_per_cluster", 8),
+
         use_objectness_filter=cluster_dict.get("use_objectness_filter", False),
         objectness_threshold=cluster_dict.get("objectness_threshold", 0.3),
         objectness_weight=cluster_dict.get("objectness_weight", 0.5),
+        apply_objectness_mask=cluster_dict.get("apply_objectness_mask", False),
+        objectness_mask_threshold=cluster_dict.get("objectness_mask_threshold"),
+        objectness_min_keep_patches=cluster_dict.get("objectness_min_keep_patches", 64),
         use_connected_components=cluster_dict.get("use_connected_components", True),
         min_component_area=cluster_dict.get("min_component_area", 150),
+        foreground_only=cluster_dict.get("foreground_only", True),
+        max_background_ratio=cluster_dict.get("max_background_ratio", 0.85),
+        merge_small_clusters=cluster_dict.get("merge_small_clusters", True),
+        min_cluster_size=cluster_dict.get("min_cluster_size", 80),
+        merge_similar_clusters=cluster_dict.get("merge_similar_clusters", True),
+        similarity_threshold=cluster_dict.get("similarity_threshold", 0.92),
+        min_similarity_cluster_size=cluster_dict.get("min_similarity_cluster_size", 0),
+        merge_edge_background=cluster_dict.get("merge_edge_background", False),
+        edge_background_area_ratio=cluster_dict.get("edge_background_area_ratio", 0.12),
+        edge_touch_ratio=cluster_dict.get("edge_touch_ratio", 0.25),
     )
     
     LOGGER.info(f"Clustering method: {cluster_cfg.clustering_method}")
@@ -129,40 +149,65 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
         LOGGER.info(f"  Selection method: {cluster_cfg.cluster_selection_method}")
     elif cluster_cfg.clustering_method == "fixed":
         LOGGER.info(f"  Fixed k: {cluster_cfg.num_clusters}")
-    
+
     # PromptConfig - 合并两个配置文件
     prompt_dict = pipeline_dict.get("prompt", {})
-    
+
     # 优先使用 prompt_config.yaml 中的配置
     point_strategy = points_config.get("point_strategy", prompt_dict.get("point_strategy", "density"))
     max_points = points_config.get("positive_points_per_box", prompt_dict.get("max_points_per_region", 5))
-    
+
+    prompt_density_settings = {}
+    if isinstance(prompt_dict.get("density_cluster"), dict):
+        prompt_density_settings.update(prompt_dict["density_cluster"])
+    if isinstance(points_config.get("density_cluster"), dict):
+        prompt_density_settings.update(points_config["density_cluster"])
+    if "method" not in prompt_density_settings:
+        prompt_density_settings.setdefault("method", "meanshift")
+    if prompt_density_settings:
+        prompt_density_cfg = DensityClusterConfig(**prompt_density_settings)
+    else:
+        prompt_density_cfg = DensityClusterConfig(method="meanshift")
+
     prompt_cfg = PromptConfig(
         include_boxes=prompt_dict.get("include_boxes", True),
         include_points=prompt_dict.get("include_points", True),
+        include_masks=prompt_dict.get("include_masks", True),
+        include_heatmaps=prompt_dict.get("include_heatmaps", False),
+        heatmap_weight=prompt_dict.get("heatmap_weight", 0.4),
         point_strategy=point_strategy,
         max_points_per_region=max_points,
+        min_positive_points=prompt_dict.get("min_positive_points", 3),
+        fallback_point_strategy=prompt_dict.get("fallback_point_strategy", "grid"),
         density_noise_handling=prompt_dict.get("density_noise_handling", "nearest"),
         grid_points_per_side=prompt_dict.get("grid_points_per_side", 3),
+        log_top_k=prompt_dict.get("log_top_k", 5),
+        mask_gaussian_sigma=prompt_dict.get("mask_gaussian_sigma", 0.0),
+        density_cluster=prompt_density_cfg,
     )
     
     LOGGER.info(f"Prompt strategy: {prompt_cfg.point_strategy}, max_points: {prompt_cfg.max_points_per_region}")
     
     superpixel_cfg = SuperpixelConfig(**pipeline_dict.get("superpixel", {}))
+    auto_superpixel_cfg = AutoSuperpixelConfig(**pipeline_dict.get("auto_superpixel", {}))
     graph_cluster_cfg = GraphClusterConfig(**pipeline_dict.get("graph_cluster", {}))
     density_cluster_cfg = DensityClusterConfig(**pipeline_dict.get("density_cluster", {}))
     crf_cfg = CRFConfig(**pipeline_dict.get("crf", {}))
-    
+
+    proposal_refine_cfg = ProposalRefineConfig(**pipeline_dict.get("proposal_refine", {}))
+
     pipeline_cfg = PipelineConfig(
         cluster=cluster_cfg,
         prompt=prompt_cfg,
         use_superpixels=pipeline_dict.get("use_superpixels", False),
         superpixel=superpixel_cfg,
+        auto_superpixel=auto_superpixel_cfg,
         use_graph_clustering=pipeline_dict.get("use_graph_clustering", False),
         graph_cluster=graph_cluster_cfg,
         use_density_clustering=pipeline_dict.get("use_density_clustering", False),
         density_cluster=density_cluster_cfg,
         crf=crf_cfg,
+        proposal_refine=proposal_refine_cfg,
     )
     
     LOGGER.info("Loading models...")
@@ -445,6 +490,8 @@ def process_and_save(
         "objectness_weight": pipeline_dict.get("objectness_weight", 0.5),
         "confidence_weight": pipeline_dict.get("confidence_weight", 0.3),
         "area_weight": pipeline_dict.get("area_weight", 0.2),
+        "min_mask_objectness": pipeline_dict.get("min_mask_objectness"),
+        "min_mask_area": pipeline_dict.get("min_mask_area"),
     }
     
     LOGGER.info(f"Processing {stem}...")

@@ -58,10 +58,10 @@ class DensityClusterer:
         try:
             import hdbscan
         except ImportError:
-            raise ImportError(
-                "Please install hdbscan: pip install hdbscan\n"
-                "Or use conda: conda install -c conda-forge hdbscan"
+            LOGGER.warning(
+                "HDBSCAN not available; falling back to MeanShift for density clustering"
             )
+            return self._meanshift_clustering(features)
         
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=self.config.min_cluster_size,

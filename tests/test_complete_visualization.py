@@ -173,7 +173,8 @@ proposals = labels_to_regions(
     label_map,
     image.shape[:2],
     cluster_cfg,
-    objectness_map=feats.get('objectness_map')
+    objectness_map=feats.get('objectness_map'),
+    patch_shape=label_map.shape,
 )
 
 print(f"✅ 候选区域生成完成")

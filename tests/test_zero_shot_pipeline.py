@@ -37,21 +37,27 @@ class StubCall:
     boxes: list
     points: list
     labels: list
+    masks: list
 
 
 class StubSegmenter:
     def __init__(self) -> None:
         self.calls: list[StubCall] = []
 
-    def segment_batched(self, image, boxes, points=None, labels=None):
+    def segment_batched(self, image, boxes=None, points=None, labels=None, mask_inputs=None):
         height, width = image.shape[:2]
         result = []
+        if boxes is None:
+            boxes = [[0, 0, width, height] for _ in range(len(points or []))]
         for box in boxes:
-            x0, y0, x1, y1 = box
-            mask = np.zeros((height, width), dtype=np.uint8)
-            mask[y0:y1, x0:x1] = 1
+            if box is None:
+                mask = np.zeros((height, width), dtype=np.uint8)
+            else:
+                x0, y0, x1, y1 = box
+                mask = np.zeros((height, width), dtype=np.uint8)
+                mask[y0:y1, x0:x1] = 1
             result.append(mask)
-        self.calls.append(StubCall(boxes, points or [], labels or []))
+        self.calls.append(StubCall(boxes, points or [], labels or [], mask_inputs or []))
         return result
 
 
@@ -79,3 +85,4 @@ def test_zero_shot_pipeline_returns_intermediate_artifacts():
     recorded = pipeline.segmenter.calls[-1]
     assert recorded.boxes == result.prompts["boxes"]
     assert recorded.points == result.prompts["points"]
+    assert recorded.masks == result.prompts["mask_inputs"]

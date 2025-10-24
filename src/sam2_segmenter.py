@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from .utils import LOGGER, chunk_iterable
+from .utils import LOGGER
 
 
 @dataclass
@@ -38,6 +38,8 @@ class SAM2Segmenter:
         self._load_model()
         if self.model is not None:
             self.model.eval()
+        self._mask_input_supported = True
+        self._huggingface_mask_warning_emitted = False
 
     def _load_model(self) -> None:
         if self.config.backend == "official" or self.config.model_id is None:
@@ -260,9 +262,15 @@ class SAM2Segmenter:
         boxes: Optional[List[Sequence[int]]],
         points: Optional[List[Sequence[Tuple[int, int]]]],
         labels: Optional[List[Sequence[int]]],
+        mask_inputs: Optional[List[np.ndarray]] = None,
     ) -> List[np.ndarray]:
         if self.processor is None or self.model is None:
             raise RuntimeError("Hugging Face SAM2 backend is not initialized")
+        if mask_inputs and not self._huggingface_mask_warning_emitted:
+            LOGGER.warning(
+                "Mask prompts are not currently supported by the Hugging Face SAM2 backend; ignoring provided masks."
+            )
+            self._huggingface_mask_warning_emitted = True
         inputs = self._prepare_inputs(image, boxes=boxes, points=points, labels=labels)
         if self.device.type == "cuda" and not self.config.load_in_8bit:
             autocast_context = torch.amp.autocast('cuda', enabled=self.dtype == torch.float16)
@@ -305,6 +313,7 @@ class SAM2Segmenter:
         box: Optional[Sequence[int]],
         points: Optional[Sequence[Tuple[int, int]]],
         labels: Optional[Sequence[int]],
+        mask_input: Optional[np.ndarray],
     ) -> Dict[str, np.ndarray]:
         if points is not None and labels is None:
             raise ValueError("Point prompts require labels")
@@ -314,6 +323,11 @@ class SAM2Segmenter:
         if points is not None and labels is not None:
             prompt["point_coords"] = np.asarray(points, dtype=np.float32)
             prompt["point_labels"] = np.asarray(labels, dtype=np.int64)
+        if mask_input is not None:
+            mask_arr = np.asarray(mask_input, dtype=np.float32)
+            if mask_arr.ndim == 2:
+                mask_arr = mask_arr[None, ...]
+            prompt["mask_input"] = mask_arr
         prompt["image"] = image
         return prompt
 
@@ -323,10 +337,11 @@ class SAM2Segmenter:
         boxes: Optional[List[Sequence[int]]],
         points: Optional[List[Sequence[Tuple[int, int]]]],
         labels: Optional[List[Sequence[int]]],
+        mask_inputs: Optional[List[np.ndarray]] = None,
     ) -> List[np.ndarray]:
         if self.predictor is None:
             raise RuntimeError("Official SAM2 backend is not initialized")
-        
+
         rgb_image = image
         if rgb_image.dtype != np.uint8:
             rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
@@ -340,17 +355,38 @@ class SAM2Segmenter:
             num_prompts = len(boxes)
         if points is not None:
             num_prompts = max(num_prompts, len(points))
+        if mask_inputs is not None:
+            num_prompts = max(num_prompts, len(mask_inputs))
         results: List[np.ndarray] = []
 
         for idx in range(num_prompts):
             box = boxes[idx] if boxes is not None and idx < len(boxes) else None
             pts = points[idx] if points is not None and idx < len(points) else None
             lbl = labels[idx] if labels is not None and idx < len(labels) else None
-            prompt = self._prepare_official_prompt(bgr_image, box, pts, lbl)
+            mask_input = None
+            if mask_inputs is not None and idx < len(mask_inputs):
+                mask_input = mask_inputs[idx]
+            prompt = self._prepare_official_prompt(bgr_image, box, pts, lbl, mask_input)
             predict_kwargs = {
-                k: v for k, v in prompt.items() if k in {"point_coords", "point_labels", "box"}
+                k: v
+                for k, v in prompt.items()
+                if k in {"point_coords", "point_labels", "box", "mask_input"}
             }
-            masks, scores, _ = self.predictor.predict(multimask_output=True, **predict_kwargs)
+            if "mask_input" in predict_kwargs and not self._mask_input_supported:
+                predict_kwargs.pop("mask_input", None)
+            try:
+                masks, scores, _ = self.predictor.predict(multimask_output=True, **predict_kwargs)
+            except TypeError as exc:
+                if "mask_input" in predict_kwargs and self._mask_input_supported:
+                    LOGGER.warning(
+                        "Official SAM2 predictor rejected mask_input; disabling mask prompts (%s)",
+                        exc,
+                    )
+                    self._mask_input_supported = False
+                    predict_kwargs.pop("mask_input", None)
+                    masks, scores, _ = self.predictor.predict(multimask_output=True, **predict_kwargs)
+                else:
+                    raise
             if isinstance(masks, torch.Tensor):
                 masks = masks.cpu().numpy()
             if isinstance(scores, torch.Tensor):
@@ -378,34 +414,67 @@ class SAM2Segmenter:
         boxes: Optional[List[Sequence[int]]] = None,
         points: Optional[List[Sequence[Tuple[int, int]]]] = None,
         labels: Optional[List[Sequence[int]]] = None,
+        mask_inputs: Optional[List[np.ndarray]] = None,
     ) -> List[np.ndarray]:
         if self._backend == "huggingface":
-            return self._segment_huggingface(image, boxes, points, labels)
-        return self._segment_official(image, boxes, points, labels)
+            return self._segment_huggingface(image, boxes, points, labels, mask_inputs=mask_inputs)
+        return self._segment_official(image, boxes, points, labels, mask_inputs=mask_inputs)
 
     @torch.inference_mode()
     def segment_batched(
         self,
         image: np.ndarray,
-        boxes: List[Sequence[int]],
+        boxes: Optional[List[Sequence[int]]] = None,
         points: Optional[List[Sequence[Tuple[int, int]]]] = None,
         labels: Optional[List[Sequence[int]]] = None,
+        mask_inputs: Optional[List[np.ndarray]] = None,
         batch_size: Optional[int] = None,
     ) -> List[np.ndarray]:
         if self._backend == "huggingface":
             if batch_size is None:
                 batch_size = self.config.max_batch_size
             batched_masks: List[np.ndarray] = []
-            offset = 0
-            for chunk_boxes in chunk_iterable(boxes, batch_size):
-                chunk_points = None
-                chunk_labels = None
-                if points is not None and labels is not None:
-                    chunk_points = points[offset : offset + len(chunk_boxes)]
-                    chunk_labels = labels[offset : offset + len(chunk_boxes)]
-                masks = self.segment(image, boxes=list(chunk_boxes), points=chunk_points, labels=chunk_labels)
+            def fetch(seq: Optional[List], start: int, end: int) -> Optional[List]:
+                if seq is None:
+                    return None
+                length = len(seq)
+                return [seq[idx] if idx < length else None for idx in range(start, end)]
+
+            total = max(
+                len(boxes) if boxes is not None else 0,
+                len(points) if points is not None else 0,
+                len(labels) if labels is not None else 0,
+                len(mask_inputs) if mask_inputs is not None else 0,
+            )
+
+            if total == 0 and boxes is not None:
+                total = len(boxes)
+
+            if total == 0:
+                return []
+
+            for start in range(0, total, batch_size):
+                end = min(total, start + batch_size)
+                chunk_boxes = fetch(boxes, start, end)
+                if chunk_boxes is not None and all(item is None for item in chunk_boxes):
+                    chunk_boxes = None
+                chunk_points = fetch(points, start, end)
+                chunk_labels = fetch(labels, start, end)
+                chunk_masks = fetch(mask_inputs, start, end)
+                masks = self.segment(
+                    image,
+                    boxes=chunk_boxes,
+                    points=chunk_points,
+                    labels=chunk_labels,
+                    mask_inputs=chunk_masks,
+                )
                 batched_masks.extend(masks)
-                offset += len(chunk_boxes)
             return batched_masks
 
-        return self.segment(image, boxes=boxes, points=points, labels=labels)
+        return self.segment(
+            image,
+            boxes=boxes,
+            points=points,
+            labels=labels,
+            mask_inputs=mask_inputs,
+        )

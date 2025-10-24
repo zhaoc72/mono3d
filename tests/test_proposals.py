@@ -38,7 +38,7 @@ def test_labels_to_regions_and_prompts(monkeypatch):
         dtype=np.int32,
     )
     config = ClusterConfig(min_region_area=4, max_regions=3)
-    proposals = labels_to_regions(label_map, (8, 8), config)
+    proposals = labels_to_regions(label_map, (8, 8), config, patch_shape=label_map.shape)
     assert len(proposals) == 3
     assert proposals[0].mask.shape == (8, 8)
 
