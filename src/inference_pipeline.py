@@ -14,6 +14,7 @@ from .prompt_generator import (
     RegionProposal,
     kmeans_cluster,
     labels_to_regions,
+    expand_region_instances,
     proposals_to_prompts,
 )
 from .sam2_segmenter import SAM2Segmenter, Sam2Config
@@ -95,10 +96,10 @@ class ZeroShotSegmentationPipeline:
 
     def _cluster_basic(self, patch_map: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """基础 KMeans 聚类"""
+        grid_h, grid_w, _ = patch_map.shape
         features = patch_map.reshape(-1, patch_map.shape[-1])
         labels, centroids = kmeans_cluster(features, self.config.cluster)
-        grid_size = int(np.sqrt(len(labels)))
-        label_map = labels.reshape(grid_size, grid_size)
+        label_map = labels.reshape(grid_h, grid_w)
         return label_map, centroids
     
     def _cluster_with_superpixels(
@@ -149,11 +150,13 @@ class ZeroShotSegmentationPipeline:
             pixel_labels[superpixel_labels == sp_id] = cluster_id
         
         # 下采样到 patch grid 用于后续处理
-        grid_size = int(np.sqrt(len(patch_features)))
+        grid_h, grid_w, _ = patch_map.shape
         from PIL import Image
         label_pil = Image.fromarray(pixel_labels.astype(np.int32), mode="I")
-        label_map = np.array(label_pil.resize((grid_size, grid_size), resample=Image.NEAREST))
-        
+        label_map = np.array(
+            label_pil.resize((grid_w, grid_h), resample=Image.NEAREST), dtype=np.int32
+        )
+
         return label_map, superpixel_features, superpixel_labels
 
     def _apply_nms(
@@ -240,14 +243,14 @@ class ZeroShotSegmentationPipeline:
         
         # 生成候选区域
         LOGGER.info("Generating region proposals...")
-        proposals = labels_to_regions(
-            label_map, 
-            image.shape[:2], 
+        semantic_proposals = labels_to_regions(
+            label_map,
+            image.shape[:2],
             self.config.cluster,
             objectness_map=objectness_map
         )
-        
-        if not proposals:
+
+        if not semantic_proposals:
             LOGGER.warning("No proposals survived filtering; returning empty result")
             return PipelineResult(
                 [],
@@ -260,14 +263,41 @@ class ZeroShotSegmentationPipeline:
                 superpixel_labels
             )
 
+        proposals = expand_region_instances(
+            semantic_proposals,
+            self.config.prompt,
+            self.config.cluster,
+            patch_map,
+            image.shape[:2],
+        )
+
+        if not proposals:
+            LOGGER.warning("Instance expansion returned no proposals; falling back to semantic regions")
+            proposals = semantic_proposals
+
         # 生成 SAM2 prompts
         LOGGER.info(f"Converting {len(proposals)} proposals to prompts...")
-        boxes, points, labels = proposals_to_prompts(proposals, self.config.prompt)
-        
+        boxes, points, labels = proposals_to_prompts(
+            proposals,
+            self.config.prompt,
+            patch_map=patch_map,
+            image_shape=image.shape[:2],
+            cluster_config=self.config.cluster,
+        )
+
         # SAM2 分割
         LOGGER.info("Running SAM2 segmentation...")
         masks = self.segmenter.segment_batched(image, boxes, points=points, labels=labels)
-        
+
+        for proposal, mask in zip(proposals, masks):
+            binary_mask = mask.astype(np.uint8)
+            proposal.mask = binary_mask
+            ys, xs = np.nonzero(binary_mask)
+            if len(xs) == 0:
+                continue
+            proposal.bbox = (int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1))
+            proposal.centroid = (int(np.round(xs.mean())), int(np.round(ys.mean())))
+
         # NMS 去重
         if nms_config is None:
             nms_config = {}
@@ -280,7 +310,13 @@ class ZeroShotSegmentationPipeline:
             masks = self._refine_masks(image, masks)
         
         # 更新 prompts
-        boxes, points, labels = proposals_to_prompts(proposals, self.config.prompt)
+        boxes, points, labels = proposals_to_prompts(
+            proposals,
+            self.config.prompt,
+            patch_map=patch_map,
+            image_shape=image.shape[:2],
+            cluster_config=self.config.cluster,
+        )
         
         prompts: Dict[str, List] = {"boxes": boxes, "points": points, "labels": labels}
         

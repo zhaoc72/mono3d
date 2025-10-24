@@ -18,8 +18,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.dinov3_feature import DINOv3FeatureExtractor, Dinov3Config
 from src.sam2_segmenter import SAM2Segmenter, Sam2Config
 from src.prompt_generator import (
-    PromptConfig, ClusterConfig,
-    kmeans_cluster, labels_to_regions, proposals_to_prompts
+    PromptConfig,
+    ClusterConfig,
+    kmeans_cluster,
+    labels_to_regions,
+    expand_region_instances,
+    proposals_to_prompts,
 )
 from src.data_loader import load_image
 from src.utils import to_torch_dtype
@@ -218,7 +222,7 @@ def main():
     print("=" * 80)
     
     proposals = labels_to_regions(label_map, image.shape[:2], cluster_cfg)
-    
+
     print(f"✅ 候选区域生成完成")
     print(f"   候选数: {len(proposals)}")
     
@@ -246,10 +250,25 @@ def main():
         include_points=True,
         point_strategy="centroid"
     )
-    
-    boxes, points, labels_list = proposals_to_prompts(proposals, prompt_config)
-    
+
+    instance_proposals = expand_region_instances(
+        proposals,
+        prompt_config,
+        cluster_cfg,
+        patch_map,
+        image.shape[:2],
+    )
+
+    boxes, points, labels_list = proposals_to_prompts(
+        instance_proposals,
+        prompt_config,
+        patch_map=patch_map,
+        image_shape=image.shape[:2],
+        cluster_config=cluster_cfg,
+    )
+
     print(f"✅ Prompts 生成完成")
+    print(f"   实例候选数: {len(instance_proposals)}")
     print(f"   Boxes: {len(boxes)}")
     print(f"   Points: {len([p for p in points if p])}")
     print(f"   Prompt配置:")
@@ -338,7 +357,7 @@ def main():
     visualize_results(
         image,
         valid_masks if valid_masks else masks,
-        proposals,
+        instance_proposals,
         heatmap,
         output_dir,
         prefix=""
@@ -353,7 +372,7 @@ def main():
     print(f"   ├─ 输入图像: {image.shape[1]}x{image.shape[0]}")
     print(f"   ├─ 特征维度: {patch_map.shape[-1]}")
     print(f"   ├─ 聚类数: {cluster_cfg.num_clusters}")
-    print(f"   ├─ 候选区域: {len(proposals)}")
+    print(f"   ├─ 候选区域: {len(instance_proposals)}")
     print(f"   ├─ 生成掩码: {len(masks)}")
     print(f"   └─ 有效掩码: {len(valid_masks)}")
     

@@ -12,6 +12,7 @@ from src.prompt_generator import (
     PromptConfig,
     kmeans_cluster,
     labels_to_regions,
+    expand_region_instances,
     proposals_to_prompts,
 )
 
@@ -40,9 +41,24 @@ def test_labels_to_regions_and_prompts(monkeypatch):
     proposals = labels_to_regions(label_map, (8, 8), config)
     assert len(proposals) == 3
     assert proposals[0].mask.shape == (8, 8)
-    boxes, points, labels = proposals_to_prompts(proposals, PromptConfig())
-    assert len(boxes) == len(points) == len(labels) == len(proposals)
-    for proposal, box, point_list in zip(proposals, boxes, points):
+
+    prompt_cfg = PromptConfig(point_strategy="centroid")
+    instance_props = expand_region_instances(
+        proposals,
+        prompt_cfg,
+        config,
+        patch_map=None,
+        image_shape=(8, 8),
+    )
+
+    boxes, points, labels = proposals_to_prompts(
+        instance_props,
+        prompt_cfg,
+        image_shape=(8, 8),
+        cluster_config=config,
+    )
+    assert len(boxes) == len(points) == len(labels) == len(instance_props)
+    for proposal, box, point_list in zip(instance_props, boxes, points):
         x0, y0, x1, y1 = box
         assert x0 < x1 and y0 < y1
         if point_list:
