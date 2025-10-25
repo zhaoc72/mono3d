@@ -338,6 +338,49 @@ class ZeroShotSegmentationPipeline:
             threshold = cfg.objectness_threshold
         return float(threshold)
 
+    def _resolve_objectness_threshold(
+        self,
+        objectness: np.ndarray,
+        context: str,
+    ) -> float:
+        """Combine static and percentile thresholds for objectness maps."""
+
+        base_threshold = max(0.0, self._objectness_threshold())
+        cfg = self.config.cluster
+        percentile = getattr(cfg, "objectness_percentile", None)
+        dynamic_value: Optional[float] = None
+
+        if percentile is not None:
+            try:
+                percentile_value = float(percentile)
+            except (TypeError, ValueError):
+                percentile_value = None
+
+            if percentile_value is not None and 0.0 < percentile_value < 1.0:
+                dynamic_value = float(np.quantile(objectness, percentile_value))
+
+        floor_ratio = float(getattr(cfg, "objectness_dynamic_floor", 0.5) or 0.0)
+        floor_ratio = float(np.clip(floor_ratio, 0.0, 1.0))
+
+        if dynamic_value is None or not np.isfinite(dynamic_value):
+            threshold = base_threshold
+        elif base_threshold <= 0.0:
+            threshold = dynamic_value
+        else:
+            min_allowed = base_threshold * floor_ratio
+            max_allowed = max(base_threshold, 0.98)
+            threshold = float(np.clip(dynamic_value, min_allowed, max_allowed))
+
+        threshold = float(np.clip(threshold, 0.0, 1.0))
+        LOGGER.debug(
+            "Objectness threshold resolved (context=%s): base=%.3f, dynamic=%s -> %.3f",
+            context,
+            base_threshold,
+            "{:.3f}".format(dynamic_value) if dynamic_value is not None else "None",
+            threshold,
+        )
+        return threshold
+
     def _build_patch_objectness_mask(
         self,
         objectness_map: Optional[np.ndarray],
@@ -359,7 +402,18 @@ class ZeroShotSegmentationPipeline:
         else:
             objectness = np.clip(objectness_map.astype(np.float32), 0.0, 1.0)
 
-        threshold = self._objectness_threshold()
+        std = float(objectness.std()) if objectness.size else 0.0
+        min_std = float(getattr(cfg, "objectness_min_std", 0.0) or 0.0)
+        if min_std > 0.0 and std < min_std:
+            LOGGER.warning(
+                "Objectness map variance too low (std=%.4f < %.4f); skipping foreground mask",
+                std,
+                min_std,
+            )
+            return None
+
+        threshold = self._resolve_objectness_threshold(objectness, context="patch")
+
         mask = objectness >= threshold
 
         min_keep = int(getattr(cfg, "objectness_min_keep_patches", 0))
@@ -659,7 +713,7 @@ class ZeroShotSegmentationPipeline:
                     scores[idx] = float(resized_mask[mask].mean())
 
             if scores is not None and len(scores) > 0:
-                threshold = self._objectness_threshold()
+                threshold = self._resolve_objectness_threshold(scores, context="superpixel")
                 valid_superpixels = scores >= threshold
 
                 total_patches = float(patch_map.shape[0] * patch_map.shape[1])

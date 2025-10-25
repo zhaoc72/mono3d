@@ -129,6 +129,8 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
         apply_objectness_mask=cluster_dict.get("apply_objectness_mask", False),
         objectness_mask_threshold=cluster_dict.get("objectness_mask_threshold"),
         objectness_min_keep_patches=cluster_dict.get("objectness_min_keep_patches", 64),
+        objectness_percentile=cluster_dict.get("objectness_percentile"),
+        objectness_min_std=cluster_dict.get("objectness_min_std", 0.0),
         use_connected_components=cluster_dict.get("use_connected_components", True),
         min_component_area=cluster_dict.get("min_component_area", 150),
         foreground_only=cluster_dict.get("foreground_only", True),

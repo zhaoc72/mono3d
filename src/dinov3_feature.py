@@ -35,6 +35,8 @@ class Dinov3Config:
     enable_pca: bool = False  # 是否启用 PCA 降维
     pca_dim: int = 32  # PCA 降维目标维度
     enable_objectness: bool = True  # 是否计算对象性评分
+    objectness_smoothing_kernel: int = 1  # 对象性图平滑核尺寸（奇数，<=1 表示禁用）
+    objectness_contrast_gamma: float = 1.0  # 对象性图的伽马调整（<1 提升对比度）
 
     def __post_init__(self) -> None:
         """Normalize legacy configuration options."""
@@ -301,8 +303,27 @@ class DINOv3FeatureExtractor:
         features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         features_cpu = features.detach().to(torch.float32).cpu().numpy()
 
+        # Additional safeguard on the numpy array to handle any residual NaNs/Infs that
+        # might appear after the device transfer (seen on certain driver/toolkit combos).
+        if not np.isfinite(features_cpu).all():
+            invalid_mask = ~np.isfinite(features_cpu)
+            invalid_rows = np.any(invalid_mask, axis=1)
+            num_invalid = int(invalid_rows.sum())
+            LOGGER.warning(
+                "PCA input contained %d rows with non-finite values; sanitizing via np.nan_to_num",
+                num_invalid,
+            )
+            features_cpu = np.nan_to_num(features_cpu, nan=0.0, posinf=0.0, neginf=0.0)
+
         if not np.isfinite(features_cpu).all():
             raise ValueError("Encountered non-finite values after sanitizing features for PCA")
+
+        total_variance = float(np.var(features_cpu, axis=0, dtype=np.float64).sum())
+        if not np.isfinite(total_variance) or total_variance <= 1e-7:
+            LOGGER.warning(
+                "Skipping PCA: insufficient variance detected (total_var=%.3e)", total_variance
+            )
+            return features
 
         if not self.pca_fitted:
             from sklearn.decomposition import PCA
@@ -313,39 +334,53 @@ class DINOv3FeatureExtractor:
             )
             reduced = self.pca.fit_transform(features_cpu)
             self.pca_fitted = True
+            explained_sum = float(np.nansum(self.pca.explained_variance_ratio_))
+            if not np.isfinite(explained_sum) or explained_sum <= 0.0:
+                LOGGER.warning(
+                    "PCA reported invalid explained variance (sum=%s); keeping float32 features",
+                    str(explained_sum),
+                )
+                self.pca_fitted = False
+                self.pca = None
+                return features
             LOGGER.info(
                 f"PCA fitted: {features.shape[1]} -> {self.config.pca_dim} dims, "
-                f"explained variance: {self.pca.explained_variance_ratio_.sum():.3f}"
+                f"explained variance: {explained_sum:.3f}"
             )
         else:
             reduced = self.pca.transform(features_cpu)
 
         return torch.from_numpy(reduced).to(features.device, dtype=torch.float32)
 
-    def _compute_objectness(self, patch_features: torch.Tensor) -> np.ndarray:
+    def _compute_objectness(self, patch_features: torch.Tensor) -> torch.Tensor:
         """
         计算对象性评分
-        
+
         Args:
             patch_features: [N, D] tensor
-            
+
         Returns:
-            Objectness scores [N] numpy array
+            Objectness scores [N] tensor
         """
-        # 归一化特征
+        # 归一化特征（使用 float32 以获得更稳定的相似度）
+        patch_features = patch_features.to(dtype=torch.float32)
+        num_tokens = patch_features.shape[0]
+        if num_tokens <= 1:
+            return torch.zeros(num_tokens, device=patch_features.device, dtype=torch.float32)
+
         patch_features_norm = F.normalize(patch_features, dim=-1)
-        
+
         # 计算相似度矩阵
         similarity_matrix = torch.mm(patch_features_norm, patch_features_norm.t())
-        
+
         # 对每个 patch，计算其与最相似的 K 个邻居的平均相似度
-        K = min(20, len(patch_features) - 1)
+        K = min(20, num_tokens - 1)
         topk_sim, _ = torch.topk(similarity_matrix, k=K + 1, dim=1, largest=True)
         avg_similarity = topk_sim[:, 1:].mean(dim=1)  # 排除自己
-        
+
         # 对象性 = 1 - 相似度（越独特 = 越可能是物体）
-        objectness = (1 - avg_similarity).cpu().numpy()
-        
+        objectness = 1 - avg_similarity
+
         return objectness
 
     @torch.inference_mode()
@@ -369,6 +404,9 @@ class DINOv3FeatureExtractor:
         fused_patch_tokens = fused_patch_tokens.to(dtype=torch.float32)
         fused_patch_tokens = torch.nan_to_num(
             fused_patch_tokens, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        objectness_tokens = (
+            fused_patch_tokens.clone() if self.config.enable_objectness else None
         )
         if not torch.isfinite(fused_patch_tokens).all():
             raise ValueError("Encountered non-finite fused patch tokens before PCA")
@@ -427,13 +465,63 @@ class DINOv3FeatureExtractor:
 
         # 计算对象性（可选）
         objectness_map = None
-        if self.config.enable_objectness:
-            objectness_scores = self._compute_objectness(fused_patch_tokens)
-            objectness_map = objectness_scores.reshape(tokens_h, tokens_w)
-            # 归一化
-            objectness_map = (objectness_map - objectness_map.min()) / (
-                objectness_map.max() - objectness_map.min() + 1e-8
+        if self.config.enable_objectness and objectness_tokens is not None:
+            objectness_scores = self._compute_objectness(objectness_tokens)
+            objectness_scores = torch.nan_to_num(
+                objectness_scores, nan=0.0, posinf=0.0, neginf=0.0
             )
+            objectness_scores = torch.clamp(objectness_scores, min=0.0)
+
+            smoothing_kernel = max(1, int(self.config.objectness_smoothing_kernel))
+            if smoothing_kernel % 2 == 0:
+                smoothing_kernel += 1
+
+            objectness_grid = objectness_scores.view(1, 1, tokens_h, tokens_w)
+            if smoothing_kernel > 1:
+                pad = smoothing_kernel // 2
+                objectness_grid = F.avg_pool2d(
+                    objectness_grid,
+                    kernel_size=smoothing_kernel,
+                    stride=1,
+                    padding=pad,
+                    count_include_pad=False,
+                )
+
+            objectness_tensor = objectness_grid.view(tokens_h, tokens_w)
+            objectness_tensor = objectness_tensor - objectness_tensor.min()
+            max_val = objectness_tensor.max()
+            if max_val > 1e-8:
+                objectness_tensor = objectness_tensor / max_val
+
+            gamma = float(getattr(self.config, "objectness_contrast_gamma", 1.0) or 1.0)
+            gamma = max(1e-3, gamma)
+            if abs(gamma - 1.0) > 1e-3:
+                objectness_tensor = objectness_tensor.clamp(min=0.0, max=1.0)
+                objectness_tensor = torch.pow(objectness_tensor, gamma)
+
+            flat_scores = objectness_tensor.reshape(-1)
+            if flat_scores.numel() >= 16:
+                try:
+                    lower = torch.quantile(flat_scores, 0.1)
+                    upper = torch.quantile(flat_scores, 0.9)
+                except RuntimeError:
+                    lower = upper = torch.tensor(float("nan"), device=objectness_tensor.device)
+
+                if torch.isfinite(lower) and torch.isfinite(upper) and float(upper - lower) > 1e-6:
+                    objectness_tensor = (objectness_tensor - lower) / (upper - lower)
+                    objectness_tensor = objectness_tensor.clamp(min=0.0, max=1.0)
+                else:
+                    mean = flat_scores.mean()
+                    std = flat_scores.std()
+                    if torch.isfinite(mean) and torch.isfinite(std) and float(std) > 1e-6:
+                        normalized = (objectness_tensor - mean) / (std * 2.0)
+                        objectness_tensor = torch.sigmoid(torch.clamp(normalized, -4.0, 4.0))
+
+            objectness_map = objectness_tensor.cpu().numpy()
+
+        patch_tokens_np = fused_patch_tokens.numpy()
+        patch_map_np = patch_map.numpy()
+        cls_token_np = cls_tokens.numpy()
 
         patch_tokens_np = fused_patch_tokens.numpy()
         patch_map_np = patch_map.numpy()

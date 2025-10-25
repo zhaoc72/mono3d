@@ -62,7 +62,9 @@ class ClusterConfig:
     apply_objectness_mask: bool = False
     objectness_mask_threshold: Optional[float] = None
     objectness_min_keep_patches: int = 64
-    
+    objectness_percentile: Optional[float] = None
+    objectness_min_std: float = 0.0
+
     # 连通域配置
     use_connected_components: bool = True
     min_component_area: int = 200
