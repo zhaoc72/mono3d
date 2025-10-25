@@ -19,6 +19,8 @@ class DensityClusterConfig:
     min_cluster_size: int = 50
     min_samples: int = 10
     cluster_selection_epsilon: float = 0.0
+    metric: str = "euclidean"
+    allow_single_cluster: bool = False
     
     # MeanShift 参数
     bandwidth: Optional[float] = None  # None = 自动估计
@@ -37,13 +39,14 @@ class DensityClusterer:
     def cluster(self, features: np.ndarray) -> np.ndarray:
         """
         执行密度聚类
-        
+
         Args:
             features: [N, D] 特征矩阵
-            
+
         Returns:
             labels: [N] 聚类标签（-1 表示噪声）
         """
+        features = np.asarray(features, dtype=np.float32)
         if self.config.method == "hdbscan":
             return self._hdbscan_clustering(features)
         elif self.config.method == "meanshift":
@@ -64,10 +67,11 @@ class DensityClusterer:
             return self._meanshift_clustering(features)
         
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=self.config.min_cluster_size,
-            min_samples=self.config.min_samples,
-            cluster_selection_epsilon=self.config.cluster_selection_epsilon,
-            metric='euclidean',
+            min_cluster_size=max(2, int(self.config.min_cluster_size)),
+            min_samples=max(1, int(self.config.min_samples)),
+            cluster_selection_epsilon=float(self.config.cluster_selection_epsilon),
+            metric=self.config.metric,
+            allow_single_cluster=bool(self.config.allow_single_cluster),
             core_dist_n_jobs=-1
         )
         

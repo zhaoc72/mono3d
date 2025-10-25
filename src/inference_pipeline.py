@@ -61,6 +61,22 @@ class PipelineConfig:
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
 
+    area_threshold: int = 0
+    kernel_size: int = 5
+    dilation_radius: int = 0
+
+    output_mask_format: str = "png"
+    save_visualization: bool = False
+    visualization_alpha: float = 0.5
+
+    enable_nms: bool = True
+    iou_threshold: float = 0.6
+    objectness_weight: float = 0.6
+    confidence_weight: float = 0.3
+    area_weight: float = 0.1
+    min_mask_objectness: float = 0.0
+    min_mask_area: int = 0
+
     # 新增：高级聚类选项
     use_superpixels: bool = False
     superpixel: SuperpixelConfig = field(default_factory=SuperpixelConfig)
@@ -139,6 +155,47 @@ class ZeroShotSegmentationPipeline:
         if size % 2 == 0:
             size += 1
         return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    @staticmethod
+    def _fill_holes(mask: np.ndarray) -> np.ndarray:
+        """Fill interior holes within a binary mask using flood fill."""
+
+        if mask.size == 0:
+            return mask.astype(np.uint8)
+
+        binary = (mask > 0).astype(np.uint8) * 255
+        height, width = binary.shape
+        flood = binary.copy()
+        flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+        cv2.floodFill(flood, flood_mask, (0, 0), 255)
+        holes = cv2.bitwise_not(flood)
+        filled = cv2.bitwise_or(binary, holes)
+        return (filled > 0).astype(np.uint8)
+
+    def _clean_masks(self, masks: Sequence[np.ndarray]) -> List[np.ndarray]:
+        """Apply morphological closing and hole filling to SAM masks."""
+
+        if not masks:
+            return []
+
+        kernel = self._build_kernel(self.config.kernel_size)
+        dilation_radius = max(0, int(self.config.dilation_radius))
+        dilation_kernel = None
+        if dilation_radius > 0:
+            size = 2 * dilation_radius + 1
+            dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+        processed: List[np.ndarray] = []
+        for mask in masks:
+            binary = (mask > 0).astype(np.uint8)
+            if kernel is not None:
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            binary = self._fill_holes(binary)
+            if dilation_kernel is not None:
+                binary = cv2.dilate(binary, dilation_kernel)
+            processed.append(binary.astype(np.uint8))
+
+        return processed
 
     @staticmethod
     def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
@@ -375,7 +432,7 @@ class ZeroShotSegmentationPipeline:
         if valid_labels.size <= 1:
             return flat_labels, False
 
-        features = patch_map.reshape(-1, patch_map.shape[-1])
+        features = patch_map.reshape(-1, patch_map.shape[-1]).astype(np.float32, copy=False)
         counts = {int(label): int(np.count_nonzero(flat_labels == label)) for label in valid_labels}
         centroids: Dict[int, np.ndarray] = {}
         for label in valid_labels:
@@ -567,11 +624,12 @@ class ZeroShotSegmentationPipeline:
         superpixel_labels = self.superpixel_gen.generate_superpixels(image)
 
         # 将 patch 特征聚合到超像素
-        patch_features = patch_map.reshape(-1, patch_map.shape[-1])
+        patch_features = patch_map.reshape(-1, patch_map.shape[-1]).astype(np.float32, copy=False)
         superpixel_features, superpixel_ids = self.superpixel_gen.aggregate_features_by_superpixels(
             patch_features,
             superpixel_labels,
-            image.shape[:2]
+            image.shape[:2],
+            patch_shape=patch_map.shape[:2],
         )
 
         valid_superpixels: Optional[np.ndarray] = None
@@ -1152,13 +1210,15 @@ class ZeroShotSegmentationPipeline:
 
         # SAM2 分割
         LOGGER.info("Running SAM2 segmentation...")
-        masks = self.segmenter.segment_batched(
+        raw_masks = self.segmenter.segment_batched(
             image,
             boxes=boxes_for_sam,
             points=points_for_sam,
             labels=labels_for_sam,
             mask_inputs=mask_inputs_for_sam,
         )
+
+        masks = self._clean_masks(raw_masks)
 
         for proposal, mask in zip(proposals, masks):
             binary_mask = mask.astype(np.uint8)
@@ -1172,8 +1232,22 @@ class ZeroShotSegmentationPipeline:
         # NMS 去重
         if nms_config is None:
             nms_config = {}
-        
-        masks, proposals = self._apply_nms(masks, proposals, nms_config)
+
+        default_nms = {
+            "enable_nms": self.config.enable_nms,
+            "iou_threshold": self.config.iou_threshold,
+            "objectness_weight": self.config.objectness_weight,
+            "confidence_weight": self.config.confidence_weight,
+            "area_weight": self.config.area_weight,
+            "min_mask_objectness": self.config.min_mask_objectness,
+            "min_mask_area": self.config.min_mask_area,
+        }
+        merged_nms = default_nms.copy()
+        for key, value in nms_config.items():
+            if value is not None:
+                merged_nms[key] = value
+
+        masks, proposals = self._apply_nms(masks, proposals, merged_nms)
         
         # CRF 细化（可选）
         if self.config.crf.enable and masks:

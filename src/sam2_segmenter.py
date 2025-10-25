@@ -19,9 +19,10 @@ class Sam2Config:
     load_in_8bit: bool = False
     max_batch_size: int = 32
     backend: str = "official"
-    
+
     # 新增：mask选择策略
     mask_selection_strategy: str = "best_balanced"  # best_score, best_balanced, largest
+    multimask_output: bool = True
 
 
 class SAM2Segmenter:
@@ -374,8 +375,12 @@ class SAM2Segmenter:
             }
             if "mask_input" in predict_kwargs and not self._mask_input_supported:
                 predict_kwargs.pop("mask_input", None)
+            multimask = bool(self.config.multimask_output)
             try:
-                masks, scores, _ = self.predictor.predict(multimask_output=True, **predict_kwargs)
+                masks, scores, _ = self.predictor.predict(
+                    multimask_output=multimask,
+                    **predict_kwargs,
+                )
             except TypeError as exc:
                 if "mask_input" in predict_kwargs and self._mask_input_supported:
                     LOGGER.warning(
@@ -384,7 +389,10 @@ class SAM2Segmenter:
                     )
                     self._mask_input_supported = False
                     predict_kwargs.pop("mask_input", None)
-                    masks, scores, _ = self.predictor.predict(multimask_output=True, **predict_kwargs)
+                    masks, scores, _ = self.predictor.predict(
+                        multimask_output=multimask,
+                        **predict_kwargs,
+                    )
                 else:
                     raise
             if isinstance(masks, torch.Tensor):
@@ -393,17 +401,16 @@ class SAM2Segmenter:
                 scores = scores.cpu().numpy()
             if masks.ndim == 4:
                 masks = masks[:, 0]
-            
-            # 使用改进的mask选择策略
-            if scores is not None and len(scores) > 0:
+
+            if multimask and scores is not None and len(scores) > 0:
                 mask = self._select_best_mask(
                     masks,
                     scores,
-                    strategy=self.config.mask_selection_strategy
+                    strategy=self.config.mask_selection_strategy,
                 )
             else:
                 mask = masks[0]
-            
+
             results.append(mask.astype(np.uint8))
         return results
 

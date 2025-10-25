@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, List
 
@@ -133,7 +134,29 @@ class DINOv3FeatureExtractor:
                 LOGGER.warning("Missing parameters when loading checkpoint: %s", missing[:5])
             if unexpected:
                 LOGGER.warning("Unexpected parameters when loading checkpoint: %s", unexpected[:5])
-        return model.to(device=self.device, dtype=self.dtype)
+        model = model.to(device=self.device, dtype=self.dtype)
+
+        # Attempt to infer patch size from the loaded model for consistency checks
+        patch_size = getattr(self.config, "patch_size", None)
+        inferred_patch: Optional[int] = None
+        if hasattr(model, "patch_embed"):
+            embed = getattr(model, "patch_embed")
+            if hasattr(embed, "patch_size"):
+                raw_size = embed.patch_size
+                if isinstance(raw_size, tuple):
+                    inferred_patch = int(raw_size[0])
+                elif isinstance(raw_size, int):
+                    inferred_patch = int(raw_size)
+        if inferred_patch and inferred_patch > 0:
+            if patch_size and patch_size != inferred_patch:
+                LOGGER.warning(
+                    "Configured patch size %d differs from model patch size %d; using model value",
+                    patch_size,
+                    inferred_patch,
+                )
+            object.__setattr__(self.config, "patch_size", inferred_patch)
+
+        return model
     
     @staticmethod
     def _is_local_repo(repo_or_dir: str) -> bool:
@@ -273,13 +296,17 @@ class DINOv3FeatureExtractor:
         """
         if not self.config.enable_pca:
             return features
-        
-        # 转到 CPU 进行 PCA
-        features_cpu = features.cpu().numpy()
-        
+
+        # Ensure float32 precision for stable PCA
+        features_cpu = features.detach().to(torch.float32).cpu().numpy()
+
         if not self.pca_fitted:
             from sklearn.decomposition import PCA
-            self.pca = PCA(n_components=self.config.pca_dim, random_state=0)
+            self.pca = PCA(
+                n_components=self.config.pca_dim,
+                random_state=0,
+                whiten=True,
+            )
             reduced = self.pca.fit_transform(features_cpu)
             self.pca_fitted = True
             LOGGER.info(
@@ -288,8 +315,8 @@ class DINOv3FeatureExtractor:
             )
         else:
             reduced = self.pca.transform(features_cpu)
-        
-        return torch.from_numpy(reduced).to(features.device, dtype=features.dtype)
+
+        return torch.from_numpy(reduced).to(features.device, dtype=torch.float32)
 
     def _compute_objectness(self, patch_features: torch.Tensor) -> np.ndarray:
         """
@@ -322,64 +349,95 @@ class DINOv3FeatureExtractor:
         """Return patch embeddings, class token features and optional attention."""
 
         inputs = self._prepare(image)
+        processed_height, processed_width = inputs.shape[-2:]
         layers = self._gather_layers(inputs)
         separated = [self._split_tokens(layer) for layer in layers]
-        
+
         # 提取每层的 patch tokens
         layer_patch_tokens = [pair[0].squeeze(0) for pair in separated]  # List of [P, D_i]
         layer_cls_tokens = [pair[1].squeeze(0) for pair in separated]     # List of [D_i]
-        
+
         # 多层特征融合
         LOGGER.debug(f"Fusing {len(layer_patch_tokens)} layers with method: {self.config.fusion_method}")
         fused_patch_tokens = self._fuse_multilayer_features(layer_patch_tokens)
-        
+
+        # 使用 float32 以确保聚类稳定
+        fused_patch_tokens = fused_patch_tokens.to(dtype=torch.float32)
+
         # PCA 降维（可选）
         if self.config.enable_pca:
             fused_patch_tokens = self._apply_pca(fused_patch_tokens)
-        
-        # 转到 CPU
-        fused_patch_tokens = fused_patch_tokens.to("cpu")
-        cls_tokens = torch.stack(layer_cls_tokens, dim=0).mean(dim=0).to("cpu")
-        
+
+        fused_patch_tokens = fused_patch_tokens.detach().cpu()
+
+        cls_tokens = (
+            torch.stack(layer_cls_tokens, dim=0)
+            .mean(dim=0)
+            .to(dtype=torch.float32)
+            .cpu()
+        )
+
         # 计算 grid size
         num_tokens = fused_patch_tokens.shape[0]
-        grid_size = int(round(np.sqrt(num_tokens)))
-        if grid_size * grid_size != num_tokens:
-            raise ValueError(
-                f"Number of patch tokens ({num_tokens}) does not form a square grid"
-            )
-        
+        patch_size = max(1, int(getattr(self.config, "patch_size", 1)))
+        tokens_h = processed_height // patch_size
+        tokens_w = processed_width // patch_size
+
+        if tokens_h * tokens_w != num_tokens:
+            fallback = int(round(math.sqrt(num_tokens)))
+            if fallback * fallback == num_tokens:
+                LOGGER.warning(
+                    "Token grid mismatch (expected %dx%d, got %d tokens); "
+                    "falling back to square grid %dx%d",
+                    tokens_h,
+                    tokens_w,
+                    num_tokens,
+                    fallback,
+                    fallback,
+                )
+                tokens_h = tokens_w = fallback
+            else:
+                raise ValueError(
+                    f"Patch tokens ({num_tokens}) do not align with patch grid "
+                    f"(processed size {processed_height}x{processed_width}, patch {patch_size})"
+                )
+
         # 重塑为 spatial map
-        patch_map = fused_patch_tokens.reshape(grid_size, grid_size, -1)
-        
+        patch_map = fused_patch_tokens.reshape(tokens_h, tokens_w, -1)
+
         # 获取 attention map
         attention = self._gather_attention(inputs)
         attention_map = None
         if attention is not None:
             attn = attention.mean(dim=1)[0]  # tokens x tokens
             cls_attention = attn[0, 1:]
-            attention_map = cls_attention.reshape(grid_size, grid_size).numpy()
+            attention_map = cls_attention.reshape(tokens_h, tokens_w).cpu().numpy()
             attention_map = (attention_map - attention_map.min()) / (
                 attention_map.max() - attention_map.min() + 1e-6
             )
-        
+
         # 计算对象性（可选）
         objectness_map = None
         if self.config.enable_objectness:
             objectness_scores = self._compute_objectness(fused_patch_tokens)
-            objectness_map = objectness_scores.reshape(grid_size, grid_size)
+            objectness_map = objectness_scores.reshape(tokens_h, tokens_w)
             # 归一化
             objectness_map = (objectness_map - objectness_map.min()) / (
                 objectness_map.max() - objectness_map.min() + 1e-8
             )
 
+        patch_tokens_np = fused_patch_tokens.numpy()
+        patch_map_np = patch_map.numpy()
+        cls_token_np = cls_tokens.numpy()
+
         return {
-            "patch_tokens": fused_patch_tokens,
-            "cls_token": cls_tokens,
-            "grid_size": (grid_size, grid_size),
-            "patch_map": patch_map,
+            "patch_tokens": patch_tokens_np,
+            "cls_token": cls_token_np,
+            "grid_size": (tokens_h, tokens_w),
+            "patch_map": patch_map_np,
             "attention_map": attention_map,
             "objectness_map": objectness_map,  # 新增
+            "processed_image_shape": (processed_height, processed_width),
         }
 
     def to(self, device: torch.device | str) -> "DINOv3FeatureExtractor":

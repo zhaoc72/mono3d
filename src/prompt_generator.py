@@ -67,6 +67,13 @@ class ClusterConfig:
     use_connected_components: bool = True
     min_component_area: int = 200
 
+    # HDBSCAN 专用参数
+    hdbscan_min_cluster_size: int = 60
+    hdbscan_min_samples: int = 20
+    hdbscan_metric: str = "euclidean"
+    hdbscan_allow_single_cluster: bool = False
+    hdbscan_cluster_selection_epsilon: float = 0.0
+
 
 @dataclass
 class PromptConfig:
@@ -309,12 +316,15 @@ def hdbscan_cluster(
         return adaptive_kmeans_cluster(features, config)
     
     # HDBSCAN聚类
+    min_cluster_size = max(2, int(getattr(config, "hdbscan_min_cluster_size", 10)))
+    min_samples = max(1, int(getattr(config, "hdbscan_min_samples", 5)))
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=max(10, len(features) // 100),
-        min_samples=5,
-        cluster_selection_epsilon=0.0,
-        metric='euclidean',
-        core_dist_n_jobs=-1
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=float(getattr(config, "hdbscan_cluster_selection_epsilon", 0.0)),
+        metric=getattr(config, "hdbscan_metric", "euclidean"),
+        allow_single_cluster=bool(getattr(config, "hdbscan_allow_single_cluster", False)),
+        core_dist_n_jobs=-1,
     )
     
     labels = clusterer.fit_predict(features)

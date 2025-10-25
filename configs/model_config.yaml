@@ -3,14 +3,16 @@ dtype: "float16"
 
 dinov3:
   repo_or_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
-  model_name: "dinov3_vith16plus"
+  model_name: "dinov3_vitl16"
   use_torch_hub: true
   torchhub_source: "local"
-  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vith16plus.pth"
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+  image_size: 448
+  patch_size: 16
 
   output_layers: [4, 8, 12]
   layer_weights: [0.2, 0.3, 0.5]
-  fusion_method: "weighted_concat"
+  fusion_method: "concat"
 
   enable_pca: true
   pca_dim: 32
@@ -23,27 +25,33 @@ sam2:
   model_id: null
   revision: null
   load_in_8bit: false
-  max_batch_size: 32
+  max_batch_size: 16
   mask_selection_strategy: "best_balanced"
+  multimask_output: false
 
 pipeline:
-  area_threshold: 100
-  kernel_size: 9
-  dilation_radius: 3
+  area_threshold: 80
+  kernel_size: 5
+  dilation_radius: 0
 
   output_mask_format: "png"
   save_visualization: true
   visualization_alpha: 0.5
 
   enable_nms: true
-  iou_threshold: 0.5
-  objectness_weight: 0.7
-  confidence_weight: 0.2
+  iou_threshold: 0.6
+  objectness_weight: 0.6
+  confidence_weight: 0.3
   area_weight: 0.1
   min_mask_objectness: 0.45
-  min_mask_area: 150
-  
+  min_mask_area: 120
+
   use_superpixels: true
+  superpixel:
+    method: "slic"
+    n_segments: 1200
+    compactness: 12.0
+    sigma: 1.0
   auto_superpixel:
     enable: true
     min_proposals: 6
@@ -55,49 +63,50 @@ pipeline:
   use_density_clustering: true
   density_cluster:
     method: "hdbscan"
-    min_cluster_size: 45
-    min_samples: 6
+    min_cluster_size: 60
+    min_samples: 20
     cluster_selection_epsilon: 0.0
-  
+    metric: "euclidean"
+    allow_single_cluster: false
+
   crf:
     enable: true
-    max_iterations: 12
-    pos_w: 4.0
-    pos_xy_std: 3.5
-    bi_w: 12.0
+    max_iterations: 5
+    pos_w: 3.0
+    pos_xy_std: 3.0
+    bi_w: 4.0
     bi_xy_std: 80.0
-    bi_rgb_std: 4.0
-  
+    bi_rgb_std: 5.0
+
   cluster:
-    # ===== 自适应聚类配置 =====
-    clustering_method: "hdbscan"  # fixed, adaptive, hdbscan, meanshift
-    
+    clustering_method: "hdbscan"
+
     # Fixed方法参数（仅当clustering_method="fixed"时使用）
     num_clusters: 6
-    
+
     # Adaptive方法参数
-    min_clusters: 6       # 最小聚类数
-    max_clusters: 30      # 最大聚类数
-    cluster_selection_method: "silhouette"  # elbow, silhouette
-    
+    min_clusters: 6
+    max_clusters: 30
+    cluster_selection_method: "silhouette"
+
     # 通用参数
     max_iterations: 40
     random_state: 0
     min_region_area: 100
-    max_regions: 40
-    min_instance_area: 60
+    max_regions: 30
+    min_instance_area: 80
     enable_instance_split: true
     max_instances_per_cluster: 12
 
     use_objectness_filter: true
     objectness_threshold: 0.45
-    objectness_weight: 0.7
+    objectness_weight: 0.5
     apply_objectness_mask: true
     objectness_mask_threshold: 0.45
     objectness_min_keep_patches: 96
 
     use_connected_components: true
-    min_component_area: 80
+    min_component_area: 120
     foreground_only: true
     max_background_ratio: 0.8
     merge_small_clusters: true
@@ -109,6 +118,12 @@ pipeline:
     edge_background_area_ratio: 0.18
     edge_touch_ratio: 0.32
 
+    hdbscan_min_cluster_size: 60
+    hdbscan_min_samples: 20
+    hdbscan_metric: "euclidean"
+    hdbscan_allow_single_cluster: false
+    hdbscan_cluster_selection_epsilon: 0.0
+
   proposal_refine:
     enable: true
     closing_kernel: 5
@@ -118,22 +133,26 @@ pipeline:
     min_keep_area: 120
 
   prompt:
-    include_boxes: true
+    include_boxes: false
     include_points: true
     include_masks: true
     include_heatmaps: false
     heatmap_weight: 0.4
     point_strategy: "density"
-    max_points_per_region: 9
+    max_points_per_region: 3
     min_positive_points: 3
-    fallback_point_strategy: "grid"
+    fallback_point_strategy: "centroid"
     density_noise_handling: "nearest"
-    grid_points_per_side: 3
+    grid_points_per_side: 0
     log_top_k: 5
     mask_gaussian_sigma: 1.5
     density_cluster:
-      method: "meanshift"
-      bandwidth: 0.7
+      method: "hdbscan"
+      min_cluster_size: 20
+      min_samples: 8
+      cluster_selection_epsilon: 0.0
+      metric: "euclidean"
+      allow_single_cluster: false
 
 reconstruction:
   output_directory: "outputs/recon_inputs"

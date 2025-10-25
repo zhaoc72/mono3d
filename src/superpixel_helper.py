@@ -131,7 +131,8 @@ class SuperpixelGenerator:
         self,
         patch_features: np.ndarray,
         superpixel_labels: np.ndarray,
-        image_shape: Tuple[int, int]
+        image_shape: Tuple[int, int],
+        patch_shape: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         在超像素内聚合 patch 特征
@@ -147,16 +148,31 @@ class SuperpixelGenerator:
             - superpixel_ids: [N_superpixels] 超像素 ID
         """
         # 计算 patch grid 大小
-        n_patches = patch_features.shape[0]
-        grid_size = int(np.sqrt(n_patches))
-        
+        features = np.asarray(patch_features, dtype=np.float32)
+        if patch_shape is None:
+            n_patches = features.shape[0]
+            grid_side = int(round(np.sqrt(n_patches)))
+            if grid_side * grid_side != n_patches:
+                raise ValueError(
+                    f"Patch features ({n_patches}) cannot form a square grid; "
+                    "please provide patch_shape explicitly"
+                )
+            patch_h, patch_w = grid_side, grid_side
+        else:
+            patch_h, patch_w = patch_shape
+            if patch_h * patch_w != features.shape[0]:
+                raise ValueError(
+                    f"Provided patch_shape {patch_shape} is incompatible with features "
+                    f"({features.shape[0]})"
+                )
+
         # 上采样 patch 特征到原图尺寸
-        patch_map = patch_features.reshape(grid_size, grid_size, -1)
+        patch_map = features.reshape(patch_h, patch_w, -1)
         height, width = image_shape
-        
+
         # 使用最近邻插值上采样每个特征通道
-        upsampled_features = np.zeros((height, width, patch_features.shape[1]), dtype=np.float32)
-        for i in range(patch_features.shape[1]):
+        upsampled_features = np.zeros((height, width, features.shape[1]), dtype=np.float32)
+        for i in range(features.shape[1]):
             upsampled_features[:, :, i] = cv2.resize(
                 patch_map[:, :, i],
                 (width, height),
@@ -166,7 +182,7 @@ class SuperpixelGenerator:
         # 在每个超像素内聚合特征
         unique_labels = np.unique(superpixel_labels)
         n_superpixels = len(unique_labels)
-        feature_dim = patch_features.shape[1]
+        feature_dim = features.shape[1]
         
         superpixel_features = np.zeros((n_superpixels, feature_dim), dtype=np.float32)
         
