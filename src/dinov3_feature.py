@@ -297,8 +297,12 @@ class DINOv3FeatureExtractor:
         if not self.config.enable_pca:
             return features
 
-        # Ensure float32 precision for stable PCA
+        # Ensure float32 precision for stable PCA and replace invalid values
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         features_cpu = features.detach().to(torch.float32).cpu().numpy()
+
+        if not np.isfinite(features_cpu).all():
+            raise ValueError("Encountered non-finite values after sanitizing features for PCA")
 
         if not self.pca_fitted:
             from sklearn.decomposition import PCA
@@ -361,8 +365,13 @@ class DINOv3FeatureExtractor:
         LOGGER.debug(f"Fusing {len(layer_patch_tokens)} layers with method: {self.config.fusion_method}")
         fused_patch_tokens = self._fuse_multilayer_features(layer_patch_tokens)
 
-        # 使用 float32 以确保聚类稳定
+        # 使用 float32 以确保聚类稳定，并清除潜在的非有限值
         fused_patch_tokens = fused_patch_tokens.to(dtype=torch.float32)
+        fused_patch_tokens = torch.nan_to_num(
+            fused_patch_tokens, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        if not torch.isfinite(fused_patch_tokens).all():
+            raise ValueError("Encountered non-finite fused patch tokens before PCA")
 
         # PCA 降维（可选）
         if self.config.enable_pca:
