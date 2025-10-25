@@ -37,6 +37,8 @@ class Dinov3Config:
     enable_objectness: bool = True  # 是否计算对象性评分
     objectness_smoothing_kernel: int = 1  # 对象性图平滑核尺寸（奇数，<=1 表示禁用）
     objectness_contrast_gamma: float = 1.0  # 对象性图的伽马调整（<1 提升对比度）
+    append_positional_features: bool = True  # 是否附加显式的坐标特征
+    positional_feature_scale: float = 0.1  # 坐标特征的缩放系数
 
     def __post_init__(self) -> None:
         """Normalize legacy configuration options."""
@@ -85,6 +87,11 @@ class Dinov3Config:
             if total > 0:
                 weights = [w / total for w in weights]
             object.__setattr__(self, "layer_weights", tuple(weights))
+
+        scale = float(getattr(self, "positional_feature_scale", 0.0) or 0.0)
+        if scale < 0.0:
+            scale = 0.0
+        object.__setattr__(self, "positional_feature_scale", float(scale))
 
 
 class DINOv3FeatureExtractor:
@@ -259,10 +266,13 @@ class DINOv3FeatureExtractor:
             Fused features [N, D_out]
         """
         if len(layer_features) == 1:
-            return layer_features[0]
-        
+            return layer_features[0].to(dtype=torch.float32)
+
+        # 先统一为 float32 再做归一化，避免半精度导致的数值塌缩
+        normalized_inputs = [feat.to(dtype=torch.float32) for feat in layer_features]
+
         # L2 归一化每一层
-        normalized = [F.normalize(feat, dim=-1) for feat in layer_features]
+        normalized = [F.normalize(feat, dim=-1) for feat in normalized_inputs]
         
         if self.config.fusion_method == "weighted_concat":
             # 加权后拼接
@@ -284,7 +294,7 @@ class DINOv3FeatureExtractor:
         # 最终 L2 归一化
         fused = F.normalize(fused, dim=-1)
         
-        return fused
+        return fused.to(dtype=torch.float32)
 
     def _apply_pca(self, features: torch.Tensor) -> torch.Tensor:
         """
@@ -519,9 +529,16 @@ class DINOv3FeatureExtractor:
 
             objectness_map = objectness_tensor.cpu().numpy()
 
-        patch_tokens_np = fused_patch_tokens.numpy()
-        patch_map_np = patch_map.numpy()
-        cls_token_np = cls_tokens.numpy()
+        # 如果需要，附加显式的坐标特征，防止特征塌缩导致的聚类失败
+        if getattr(self.config, "append_positional_features", False):
+            scale = float(getattr(self.config, "positional_feature_scale", 0.0) or 0.0)
+            if scale > 0.0:
+                y_coords = torch.linspace(-1.0, 1.0, tokens_h, device=patch_map.device, dtype=patch_map.dtype)
+                x_coords = torch.linspace(-1.0, 1.0, tokens_w, device=patch_map.device, dtype=patch_map.dtype)
+                grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+                coord_map = torch.stack((grid_y, grid_x), dim=-1) * scale
+                patch_map = torch.cat([patch_map, coord_map], dim=-1)
+                fused_patch_tokens = patch_map.reshape(-1, patch_map.shape[-1])
 
         patch_tokens_np = fused_patch_tokens.numpy()
         patch_map_np = patch_map.numpy()

@@ -99,7 +99,18 @@ class DensityClusterer:
             from sklearn.cluster import MeanShift, estimate_bandwidth
         except ImportError:
             raise ImportError("Please install scikit-learn: pip install scikit-learn")
-        
+
+        if features.size == 0:
+            return np.empty((0,), dtype=np.int32)
+
+        feature_variance = float(np.var(features.astype(np.float32)))
+        if not np.isfinite(feature_variance) or feature_variance <= 1e-8:
+            LOGGER.warning(
+                "Feature variance %.3e too low for MeanShift; collapsing to a single cluster",
+                feature_variance,
+            )
+            return np.zeros(len(features), dtype=np.int32)
+
         # 估计 bandwidth（如果未提供）
         bandwidth = self.config.bandwidth
         if bandwidth is None:
@@ -109,7 +120,16 @@ class DensityClusterer:
                 n_samples=min(500, len(features))
             )
             LOGGER.info(f"Estimated bandwidth: {bandwidth:.4f}")
-        
+
+        if not np.isfinite(bandwidth) or float(bandwidth) <= 0.0:
+            fallback = max(1e-3, float(np.finfo(np.float32).eps))
+            LOGGER.warning(
+                "MeanShift bandwidth %.4f is not positive; using fallback value %.4f",
+                float(bandwidth),
+                fallback,
+            )
+            bandwidth = fallback
+
         # MeanShift 聚类
         ms = MeanShift(
             bandwidth=bandwidth,

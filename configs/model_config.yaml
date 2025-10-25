@@ -19,6 +19,8 @@ dinov3:
   enable_objectness: true
   objectness_smoothing_kernel: 3
   objectness_contrast_gamma: 0.85
+  append_positional_features: true
+  positional_feature_scale: 0.12
 
 sam2:
   backend: "official"
