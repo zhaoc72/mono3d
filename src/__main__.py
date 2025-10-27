@@ -20,6 +20,7 @@ from .dinov3_feature import DINOv3FeatureExtractor, Dinov3Config
 from .class_aware_pipeline import (
     ClassAwarePipelineResult,
     ClassAwarePromptPipeline,
+    FusionWeights,
     PromptFusionConfig,
     PromptPostProcessConfig,
 )
@@ -411,7 +412,12 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline | ClassAwarePro
         )
         LOGGER.info("No fine-tuning required: all modules run in zero-shot mode with official checkpoints")
 
-        fusion_cfg = PromptFusionConfig(**class_aware_cfg.get("prompt_fusion", {}))
+        fusion_dict = class_aware_cfg.get("prompt_fusion", {})
+        # 确保 score_weights 正确实例化为 FusionWeights 对象
+        if "score_weights" in fusion_dict and isinstance(fusion_dict["score_weights"], dict):
+            fusion_dict["score_weights"] = FusionWeights(**fusion_dict["score_weights"])
+        fusion_cfg = PromptFusionConfig(**fusion_dict)
+        
         post_cfg = PromptPostProcessConfig(**class_aware_cfg.get("prompt_postprocess", {}))
         foreground_ids = class_aware_cfg.get("foreground_class_ids")
         background_ids = class_aware_cfg.get("background_class_ids")

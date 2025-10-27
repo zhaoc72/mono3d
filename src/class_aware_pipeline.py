@@ -355,6 +355,29 @@ class ClassAwarePromptPipeline:
             else set()
         )
 
+    def _project_features_to_adapter_dim(
+        self,
+        patch_tokens: np.ndarray,
+        target_dim: int,
+    ) -> np.ndarray:
+        """将融合后的特征投影到适配器期望的维度"""
+        current_dim = patch_tokens.shape[-1]
+        
+        if current_dim == target_dim:
+            return patch_tokens
+        
+        if current_dim < target_dim:
+            # 需要扩展维度 - 用零填充
+            padding = np.zeros((patch_tokens.shape[0], target_dim - current_dim), dtype=patch_tokens.dtype)
+            return np.concatenate([patch_tokens, padding], axis=-1)
+        else:
+            # 需要降维 - 使用简单的线性投影（取前 target_dim 维）
+            LOGGER.warning(
+                f"Feature dimension ({current_dim}) exceeds adapter expectation ({target_dim}); "
+                f"truncating to first {target_dim} dimensions"
+            )
+            return patch_tokens[:, :target_dim]
+
     def _compute_foreground_mask(
         self,
         seg_probs: np.ndarray,
@@ -362,9 +385,19 @@ class ClassAwarePromptPipeline:
         candidate_classes: Sequence[int],
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         cfg = self.fusion_config
+        
+        # 确保 obj_map 的形状与 seg_probs 一致
+        if obj_map.shape != seg_probs.shape[1:]:
+            LOGGER.debug(
+                f"Resizing objectness map from {obj_map.shape} to {seg_probs.shape[1:]}"
+            )
+            obj_map = _resize_map(obj_map, seg_probs.shape[1:][::-1])  # (H, W)
+        
         obj_mask = obj_map > cfg.objectness_threshold
+        
         if len(candidate_classes) == 0:
             return obj_mask, np.zeros_like(obj_map), np.zeros_like(obj_map, dtype=np.int32)
+        
         class_probs = seg_probs[candidate_classes, :, :]
         max_probs = class_probs.max(axis=0)
         class_indices = class_probs.argmax(axis=0)
@@ -523,8 +556,17 @@ class ClassAwarePromptPipeline:
             LOGGER.warning("Objectness map not provided by extractor; defaulting to uniform foreground")
             objectness_map = np.ones(grid_size, dtype=np.float32)
 
-        det_output = self.detection_adapter.predict(patch_tokens, processed_shape[::-1], grid_size)
-        seg_output = self.segmentation_adapter.predict(patch_tokens, processed_shape[::-1], grid_size)
+        # 投影特征到适配器期望的维度（1024）
+        LOGGER.debug(f"Original feature dimension: {patch_tokens.shape[-1]}")
+        patch_tokens_for_adapters = self._project_features_to_adapter_dim(patch_tokens, target_dim=1024)
+        LOGGER.debug(f"Projected feature dimension: {patch_tokens_for_adapters.shape[-1]}")
+
+        det_output = self.detection_adapter.predict(
+            patch_tokens_for_adapters, processed_shape[::-1], grid_size
+        )
+        seg_output = self.segmentation_adapter.predict(
+            patch_tokens_for_adapters, processed_shape[::-1], grid_size
+        )
 
         det_processed = DetectionOutput(
             boxes=np.asarray(det_output.boxes, dtype=np.float32).copy(),
@@ -675,4 +717,3 @@ class ClassAwarePromptPipeline:
             original_shape=original_shape,
             detection_processed=det_processed,
         )
-
