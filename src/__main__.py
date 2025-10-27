@@ -95,11 +95,32 @@ def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
     for raw_path in paths:
         if not raw_path:
             continue
-        expanded = os.path.expanduser(str(raw_path))
-        if expanded in sys.path:
-            continue
-        if os.path.isdir(expanded) or (os.path.isfile(expanded) and expanded.endswith(".py")):
-            sys.path.insert(0, expanded)
+
+        expanded = os.path.abspath(os.path.expanduser(str(raw_path)))
+        candidate_paths: List[str] = []
+
+        if os.path.isdir(expanded):
+            candidate_paths.append(expanded)
+
+            src_path = os.path.join(expanded, "src")
+            if os.path.isdir(src_path):
+                candidate_paths.append(src_path)
+        elif os.path.isfile(expanded) and expanded.endswith(".py"):
+            candidate_paths.append(os.path.dirname(expanded))
+
+        added_any = False
+        for candidate in candidate_paths:
+            if candidate and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+                LOGGER.debug("Added %s to sys.path for adapter imports", candidate)
+                added_any = True
+
+        if not added_any:
+            LOGGER.warning(
+                "Unable to register adapter path '%s' (exists: %s)",
+                expanded,
+                os.path.exists(expanded),
+            )
 
 
 def _invoke_factory(factory: Any, kwargs: Dict[str, Any]) -> Any:
@@ -141,7 +162,15 @@ def _instantiate_adapter(
         raise ValueError(f"Invalid adapter target '{target}'. Use 'module.submodule:callable'")
 
     LOGGER.info("Loading adapter factory %s", target)
-    module = importlib.import_module(module_path)
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        search_hint = ", ".join(sys.path[:10])
+        raise RuntimeError(
+            "Failed to import adapter module '%s'. "
+            "Ensure the DINOv3 repository is available and python_paths are configured. "
+            "Current sys.path head: %s" % (module_path, search_hint)
+        ) from exc
     factory: Any = module
     for part in attr.split("."):
         factory = getattr(factory, part)
