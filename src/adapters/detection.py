@@ -247,7 +247,27 @@ class DetectionAdapter:
             class_names = self.COCO_CLASSES[:num_classes]
         self.class_names = list(class_names)
         self.score_threshold = float(score_threshold)
-        
+
+    def _ensure_input_dim(self, feature_dim: int) -> None:
+        """Resize the input projection layer if the backbone feature dimension changes."""
+
+        current_dim = getattr(self.model, "feature_dim", feature_dim)
+        if feature_dim == current_dim:
+            return
+
+        LOGGER.info(
+            "Adapting detection adapter input dimension from %d to %d",
+            current_dim,
+            feature_dim,
+        )
+
+        new_proj = nn.Linear(feature_dim, self.model.hidden_dim)
+        nn.init.xavier_uniform_(new_proj.weight)
+        if new_proj.bias is not None:
+            nn.init.zeros_(new_proj.bias)
+        self.model.input_proj = new_proj.to(device=self.device, dtype=self.dtype)
+        self.model.feature_dim = feature_dim
+
     @torch.inference_mode()
     def predict(
         self,
@@ -270,10 +290,13 @@ class DetectionAdapter:
         tokens_tensor = torch.from_numpy(patch_tokens).to(
             device=self.device, dtype=self.dtype
         )
-        
+
+        # Ensure the adapter can consume the provided feature dimension
+        self._ensure_input_dim(tokens_tensor.shape[-1])
+
         # Reshape to [1, N, D] for batch processing
         tokens_tensor = tokens_tensor.unsqueeze(0)
-        
+
         # Run detection
         try:
             boxes, scores, labels = self.model(tokens_tensor, image_size, grid_size)

@@ -168,7 +168,27 @@ class SegmentationAdapter:
             class_names = self.ADE20K_CLASSES[:num_classes]
         self.class_names = list(class_names)
         self.num_classes = num_classes
-        
+
+    def _ensure_input_dim(self, feature_dim: int) -> None:
+        """Ensure the classifier expects the provided feature dimension."""
+
+        current_dim = getattr(self.model, "feature_dim", feature_dim)
+        if feature_dim == current_dim:
+            return
+
+        LOGGER.info(
+            "Adapting segmentation adapter input dimension from %d to %d",
+            current_dim,
+            feature_dim,
+        )
+
+        new_classifier = nn.Conv2d(feature_dim, self.model.num_classes, kernel_size=1)
+        nn.init.xavier_uniform_(new_classifier.weight)
+        if new_classifier.bias is not None:
+            nn.init.zeros_(new_classifier.bias)
+        self.model.classifier = new_classifier.to(device=self.device, dtype=self.dtype)
+        self.model.feature_dim = feature_dim
+
     @torch.inference_mode()
     def predict(
         self,
@@ -191,10 +211,11 @@ class SegmentationAdapter:
         tokens_tensor = torch.from_numpy(patch_tokens).to(
             device=self.device, dtype=self.dtype
         )
-        
+
         # Reshape to [1, H, W, D] for segmentation head
         grid_h, grid_w = grid_size
         feature_dim = tokens_tensor.shape[-1]
+        self._ensure_input_dim(feature_dim)
         tokens_reshaped = tokens_tensor.reshape(grid_h, grid_w, feature_dim)
         tokens_batch = tokens_reshaped.unsqueeze(0)  # [1, H, W, D]
         

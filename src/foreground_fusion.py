@@ -42,7 +42,18 @@ def _activation_to_probs(segmentation: SegmentationOutput) -> np.ndarray:
 def _resize_tensor(data: np.ndarray, size: Tuple[int, int], mode: str = "bilinear") -> np.ndarray:
     if data.shape[-2:] == size:
         return data
-    tensor = torch.from_numpy(data).unsqueeze(0)
+
+    tensor = torch.from_numpy(data)
+    added_dims = 0
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
+        added_dims = 2
+    elif tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+        added_dims = 1
+    elif tensor.ndim < 2:
+        raise ValueError("Expected at least 2 spatial dimensions for resize operation")
+
     align_corners = mode in {"bilinear", "bicubic"}
     resized = torch.nn.functional.interpolate(
         tensor,
@@ -50,7 +61,13 @@ def _resize_tensor(data: np.ndarray, size: Tuple[int, int], mode: str = "bilinea
         mode=mode,
         align_corners=align_corners,
     )
-    return resized.squeeze(0).cpu().numpy()
+
+    if added_dims == 2:
+        resized = resized.squeeze(0).squeeze(0)
+    elif added_dims == 1:
+        resized = resized.squeeze(0)
+
+    return resized.cpu().numpy()
 
 
 def _match_segmentation_channel(
