@@ -1,6 +1,5 @@
-# DINOv3 Adapter 配置文件 (修复版)
-# 生成时间: 2025-10-27 14:12:27
-# 修复说明: 使用随机初始化的 adapter,解决权重加载问题
+# DINOv3 配置文件（修正版）
+# 使用实际的文件路径
 
 model:
   name: "dinov3_adapter"
@@ -10,27 +9,67 @@ model:
   # ============================================
   backbone:
     type: "dinov3"
-    model_name: "dinov3_vit7b16"
     
-    # 方案 1: 使用原始 checkpoint (包含额外权重)
+    # Model paths
+    repo_path: "/media/pc/D/zhaochen/mono3d/dinov3"
+    model_name: "dinov3_vit7b16"
     checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_lvd1689m.pth"
     
-    # 方案 2: 使用提取后的纯净 backbone (推荐)
-    # checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_backbone_only.pth"
-    
-    # 方案 3: 使用官方 DINOv2 预训练权重
-    # checkpoint_path: "/path/to/dinov2_vitl14_pretrain.pth"
-    
-    freeze: true  # 冻结 backbone,只训练 adapter
-    
-    # 架构参数 (ViT-7B/16)
+    # Model architecture
     patch_size: 16
-    embed_dim: 3200  # 7B 模型的嵌入维度
-    num_heads: 25    # 7B 模型的注意力头数
-    num_layers: 40   # 7B 模型的层数
+    embed_dim: 1024
+    num_heads: 16
+    num_layers: 24
+    image_size: [224, 224]
     
-    # 输出特征层 (用于多尺度特征)
-    output_layers: [9, 19, 29, 39]  # 输出第 10, 20, 30, 40 层
+    # Training settings
+    freeze: true
+    
+    # Memory optimization settings (NEW)
+    memory_efficient_attention: true    # Enable memory efficient attention
+    gradient_checkpointing: false       # Enable if training, disable for inference
+    cpu_offload: false                  # Offload model to CPU between forward passes
+    load_in_8bit: false                 # Use 8-bit quantization (experimental)
+    
+    # Feature extraction settings
+    output_layers: [11, 17, 23]
+    layer_weights: [1.0, 1.0, 1.0]
+    fusion_method: "weighted_sum"
+    
+    # PCA and objectness
+    enable_objectness: true
+    enable_pca: false
+    pca_dim: 64
+    
+    # Positional features
+    append_positional_features: true
+    positional_feature_scale: 1.0
+    
+    # Objectness post-processing
+    objectness_smoothing_kernel: 5
+    objectness_contrast_gamma: 2.0
+    
+    # Device settings
+    dtype: "float16"  # Use float16 to save memory (was float32)
+    device: "cuda"    # Will auto-detect multi-GPU
+
+  # Alternative configurations for different scenarios:
+
+  # Configuration 1: Maximum memory saving (slower)
+  # dtype: "float16"
+  # memory_efficient_attention: true
+  # cpu_offload: true
+  # gradient_checkpointing: true
+
+  # Configuration 2: Balanced (recommended for 4x24GB GPUs)
+  # dtype: "float16"
+  # memory_efficient_attention: true
+  # cpu_offload: false
+  # gradient_checkpointing: false
+
+  # Configuration 3: Use smaller model
+  # model_name: "dinov3_vitl16"  # Large instead of 7B
+  # checkpoint_path: "/path/to/dinov3_vitl16.pth"
   
   # ============================================
   # Detection Adapter 配置
@@ -38,27 +77,27 @@ model:
   detection_adapter:
     type: "detr_head"
     
-    # ⭐ 核心修复: 使用随机初始化
-    checkpoint_path: ""  # 留空表示随机初始化
+    # Detection adapter 权重路径
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
     
-    freeze: false  # 需要训练
+    freeze: false  # adapter 需要训练/微调
     
-    # 架构参数
+    # COCO 检测配置
+    feature_dim: 3200  # 输入特征维度（与 backbone 一致）
+    num_classes: 91  # COCO 数据集类别数（80 类 + 背景）
+    
+    # DETR 架构
     hidden_dim: 256
     num_queries: 300
-    num_classes: 80  # COCO 数据集类别数
-    
-    # Transformer 配置
     nheads: 8
     num_encoder_layers: 6
     num_decoder_layers: 6
     dim_feedforward: 2048
     dropout: 0.1
     
-    # 辅助损失
+    # 推理配置
+    score_threshold: 0.05  # 降低阈值以获得更多检测
     aux_loss: true
-    
-    # Objectness 分支
     use_objectness: true
   
   # ============================================
@@ -67,16 +106,17 @@ model:
   segmentation_adapter:
     type: "mask_head"
     
-    # ⭐ 核心修复: 使用随机初始化
-    checkpoint_path: ""  # 留空表示随机初始化
+    # Segmentation adapter 权重路径
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
     
-    freeze: false  # 需要训练
+    freeze: false  # adapter 需要训练/微调
     
-    # 架构参数
+    # ADE20K 分割配置
+    feature_dim: 3200  # 输入特征维度（与 backbone 一致）
+    num_classes: 150  # ADE20K 数据集类别数
+    
+    # Mask 解码器
     hidden_dim: 256
-    num_classes: 133  # ADE20K 数据集类别数
-    
-    # Mask 解码器配置
     num_mask_tokens: 100
     mask_dim: 256
     
@@ -85,92 +125,70 @@ model:
     fpn_scales: [8, 16, 32]
 
 # ============================================
+# Fusion 配置
+# ============================================
+fusion:
+  objectness_threshold: 0.45
+  segmentation_threshold: 0.35
+  detection_score_threshold: 0.05  # 与 detection_adapter.score_threshold 一致
+  min_instance_area: 60
+  dilation_kernel: 3
+  nms_iou_threshold: 0.6
+
+# ============================================
+# Prompt 生成配置
+# ============================================
+prompts:
+  include_points: true
+  include_boxes: true
+  include_masks: true
+  max_points_per_region: 3
+  grid_points_per_side: 0
+  min_score: 0.0
+  max_prompts: 128
+  max_prompts_per_class: 0
+  nms_iou_threshold: 0.5
+
+# ============================================
+# Instance Grouping 配置
+# ============================================
+instance_grouping:
+  method: "connected_components"
+  min_area: 60
+  use_density_clustering: false
+
+# ============================================
+# 后处理配置
+# ============================================
+postprocess:
+  enable: true
+  closing_kernel: 5
+  opening_kernel: 3
+  min_instance_area: 60
+
+# ============================================
+# SAM2 配置
+# ============================================
+sam2:
+  backend: "official"
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
+  model_config: "sam2.1/sam2.1_hiera_l"
+  max_batch_size: 32
+  
+  # Mask 选择策略
+  mask_selection_strategy: "best_balanced"
+  multimask_output: true
+
+# ============================================
 # 推理配置
 # ============================================
 inference:
-  device: "cuda"  # 或 "cpu"
-  
-  detection:
-    score_threshold: 0.05  # 降低阈值以获得更多检测
-    nms_threshold: 0.5
-    max_detections: 100
-  
-  segmentation:
-    score_threshold: 0.5
-    min_mask_area: 100  # 最小 mask 面积(像素)
-    
-  # 批处理
+  device: "cuda"
+  dtype: "float32"
   batch_size: 1
   
   # 图像预处理
-  image_size: [1024, 1024]  # [height, width]
+  image_size: [518, 518]  # [height, width]
   normalize:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
-
-# ============================================
-# 训练配置 (如果需要)
-# ============================================
-training:
-  # 基础配置
-  batch_size: 4
-  num_epochs: 50
-  gradient_accumulation_steps: 1
-  
-  # 优化器
-  optimizer:
-    type: "adamw"
-    lr: 1.0e-4
-    weight_decay: 1.0e-4
-    betas: [0.9, 0.999]
-  
-  # 学习率调度
-  scheduler:
-    type: "cosine"
-    warmup_epochs: 5
-    min_lr: 1.0e-6
-  
-  # 损失权重
-  loss_weights:
-    detection_class: 2.0
-    detection_bbox: 5.0
-    detection_giou: 2.0
-    segmentation_mask: 5.0
-    segmentation_dice: 1.0
-  
-  # 数据增强
-  augmentation:
-    random_flip: true
-    random_crop: true
-    color_jitter: true
-    
-  # 检查点
-  checkpoint:
-    save_dir: "./checkpoints"
-    save_interval: 5  # 每 5 个 epoch 保存一次
-    keep_last_n: 3  # 保留最后 3 个检查点
-
-# ============================================
-# 数据配置
-# ============================================
-data:
-  detection:
-    dataset: "coco"
-    train_anno: "/path/to/coco/annotations/instances_train2017.json"
-    val_anno: "/path/to/coco/annotations/instances_val2017.json"
-    image_dir: "/path/to/coco/images"
-  
-  segmentation:
-    dataset: "ade20k"
-    train_anno: "/path/to/ade20k/annotations/training"
-    val_anno: "/path/to/ade20k/annotations/validation"
-    image_dir: "/path/to/ade20k/images"
-
-# ============================================
-# 日志配置
-# ============================================
-logging:
-  log_dir: "./logs"
-  tensorboard: true
-  wandb: false
-  print_interval: 10  # 每 10 个 iteration 打印一次

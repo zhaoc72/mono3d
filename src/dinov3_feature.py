@@ -124,7 +124,18 @@ class Dinov3Backbone:
                 LOGGER.warning("Missing parameters when loading checkpoint: %s", missing[:5])
             if unexpected:
                 LOGGER.warning("Unexpected parameters when loading checkpoint: %s", unexpected[:5])
-        model = model.to(device=self.device, dtype=self.dtype)
+        
+        model = model.to(device='cpu', dtype=self.dtype)
+    
+        # 使用 DataParallel 或手动分片
+        if torch.cuda.device_count() > 1:
+            print(f"   Using {torch.cuda.device_count()} GPUs")
+            model = torch.nn.DataParallel(model)
+        
+        # 然后移动到 GPU
+        model = model.to(device=self.device)
+        
+        return model
 
         # Attempt to infer patch size from the loaded model for consistency checks
         patch_size = getattr(self.config, "patch_size", None)
