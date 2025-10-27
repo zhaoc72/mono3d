@@ -23,7 +23,7 @@ def normalize_to_uint8(data: np.ndarray) -> np.ndarray:
     if not finite.any():
         return np.zeros_like(data, dtype=np.uint8)
     
-    clipped = np.zeros_like(data, dtype=np.float32)
+    clipped = np.zeros_like(data, dtype=np.float16)
     clipped[finite] = data[finite]
     minimum = float(clipped[finite].min())
     maximum = float(clipped[finite].max())
@@ -105,7 +105,7 @@ def main():
     
     # 设置设备和数据类型
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32
+    dtype = torch.float16
     print(f"   Device: {device}")
     print(f"   Dtype: {dtype}")
     
