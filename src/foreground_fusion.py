@@ -94,6 +94,13 @@ def _apply_box(mask: np.ndarray, box: Sequence[float]) -> np.ndarray:
     return region
 
 
+def _mask_to_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return 0, 0, 0, 0
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
 def fuse_foreground_regions(
     detection: DetectionOutput,
     segmentation: SegmentationOutput,
@@ -172,6 +179,67 @@ def fuse_foreground_regions(
                 detection_index=idx,
             )
         )
+
+    if not candidates:
+        LOGGER.info(
+            "No detection candidates passed filtering; falling back to segmentation/objectness cues",
+        )
+
+        class_scores = probs_resized.max(axis=0)
+        class_indices = probs_resized.argmax(axis=0)
+        fallback_mask = class_scores >= fusion_cfg.segmentation_threshold
+        if objectness_resized is not None:
+            fallback_mask &= objectness_resized >= fusion_cfg.objectness_threshold
+
+        fallback_candidates: List[CandidateRegion] = []
+        if fallback_mask.any():
+            unique_classes = np.unique(class_indices[fallback_mask])
+            for cls in unique_classes:
+                class_mask = (class_indices == cls) & fallback_mask
+                if not class_mask.any():
+                    continue
+                area = int(class_mask.sum())
+                if area < fusion_cfg.min_instance_area:
+                    continue
+                class_name = (
+                    segmentation.class_names[int(cls)]
+                    if segmentation.class_names and int(cls) < len(segmentation.class_names)
+                    else str(int(cls))
+                )
+                mean_seg_score = float(class_scores[class_mask].mean())
+                score_components = [mean_seg_score]
+                if objectness_resized is not None:
+                    score_components.append(float(objectness_resized[class_mask].mean()))
+                fused_score = float(np.mean(score_components))
+                fallback_candidates.append(
+                    CandidateRegion(
+                        mask=class_mask.astype(np.uint8),
+                        bbox=_mask_to_bbox(class_mask),
+                        class_id=int(cls),
+                        class_name=class_name,
+                        score=fused_score,
+                        detection_index=None,
+                    )
+                )
+
+        if not fallback_candidates and objectness_resized is not None:
+            object_mask = objectness_resized >= fusion_cfg.objectness_threshold
+            if object_mask.any():
+                area = int(object_mask.sum())
+                if area >= fusion_cfg.min_instance_area:
+                    fused_score = float(objectness_resized[object_mask].mean())
+                    fallback_candidates.append(
+                        CandidateRegion(
+                            mask=object_mask.astype(np.uint8),
+                            bbox=_mask_to_bbox(object_mask),
+                            class_id=-1,
+                            class_name="objectness",
+                            score=fused_score,
+                            detection_index=None,
+                        )
+                    )
+
+        candidates.extend(fallback_candidates)
 
     debug = FusionDebugInfo(segmentation_probs=probs_resized, objectness_resized=objectness_resized)
     return candidates, debug
