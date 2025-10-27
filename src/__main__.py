@@ -91,7 +91,14 @@ def load_configs(config_path: str, prompt_config_path: Optional[str] = None) -> 
     return config
 
 
-def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
+def _maybe_extend_sys_path(paths: Sequence[str]) -> List[str]:
+    """Ensure adapter search paths are present on sys.path.
+
+    Returns the normalized candidate directories considered so downstream
+    import helpers can perform additional discovery if needed.
+    """
+
+    normalized: List[str] = []
     for raw_path in paths:
         if not raw_path:
             continue
@@ -100,11 +107,11 @@ def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
         candidate_paths: List[str] = []
 
         if os.path.isdir(expanded):
-            candidate_paths.append(expanded)
-
-            src_path = os.path.join(expanded, "src")
-            if os.path.isdir(src_path):
-                candidate_paths.append(src_path)
+            subdirs = ["", "src", "projects", os.path.join("src", "projects")]
+            for subdir in subdirs:
+                candidate = os.path.join(expanded, subdir) if subdir else expanded
+                if candidate and os.path.isdir(candidate):
+                    candidate_paths.append(candidate)
         elif os.path.isfile(expanded) and expanded.endswith(".py"):
             candidate_paths.append(os.path.dirname(expanded))
 
@@ -114,6 +121,13 @@ def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
                 sys.path.insert(0, candidate)
                 LOGGER.debug("Added %s to sys.path for adapter imports", candidate)
                 added_any = True
+            elif candidate:
+                LOGGER.debug(
+                    "Adapter path already present on sys.path: %s", candidate
+                )
+                added_any = True
+
+        normalized.extend(candidate_paths)
 
         if not added_any:
             LOGGER.warning(
@@ -121,6 +135,36 @@ def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
                 expanded,
                 os.path.exists(expanded),
             )
+
+    # Preserve order while removing duplicates so follow-up discovery work does not
+    # repeatedly traverse the same directories.
+    return list(dict.fromkeys(normalized))
+
+
+def _augment_sys_path_for_module(module_path: str, search_roots: Sequence[str]) -> None:
+    """Attempt to register additional parent directories for nested adapters."""
+
+    if not search_roots:
+        return
+
+    namespace = module_path.split(".", 1)[0]
+    candidate_bases = ("", "src", "projects", os.path.join("src", "projects"))
+
+    for root in search_roots:
+        for base in candidate_bases:
+            parent = os.path.join(root, base) if base else root
+            if not parent or not os.path.isdir(parent):
+                continue
+
+            pkg_dir = os.path.join(parent, namespace)
+            if not os.path.isdir(pkg_dir):
+                continue
+
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+                LOGGER.debug(
+                    "Discovered nested adapter namespace '%s' under %s", namespace, parent
+                )
 
 
 def _invoke_factory(factory: Any, kwargs: Dict[str, Any]) -> Any:
@@ -155,7 +199,7 @@ def _instantiate_adapter(
     python_paths = adapter_cfg.get("python_paths") or []
     if isinstance(python_paths, str):
         python_paths = [python_paths]
-    _maybe_extend_sys_path(list(extra_paths) + list(python_paths))
+    search_roots = _maybe_extend_sys_path(list(extra_paths) + list(python_paths))
 
     module_path, _, attr = target.partition(":")
     if not attr:
@@ -164,13 +208,17 @@ def _instantiate_adapter(
     LOGGER.info("Loading adapter factory %s", target)
     try:
         module = importlib.import_module(module_path)
-    except ModuleNotFoundError as exc:
-        search_hint = ", ".join(sys.path[:10])
-        raise RuntimeError(
-            "Failed to import adapter module '%s'. "
-            "Ensure the DINOv3 repository is available and python_paths are configured. "
-            "Current sys.path head: %s" % (module_path, search_hint)
-        ) from exc
+    except ModuleNotFoundError:
+        _augment_sys_path_for_module(module_path, search_roots)
+        try:
+            module = importlib.import_module(module_path)
+        except ModuleNotFoundError as exc:  # pragma: no cover - re-raise with context
+            search_hint = ", ".join(sys.path[:10])
+            raise RuntimeError(
+                "Failed to import adapter module '%s'. "
+                "Ensure the DINOv3 repository is available and python_paths are configured. "
+                "Current sys.path head: %s" % (module_path, search_hint)
+            ) from exc
     factory: Any = module
     for part in attr.split("."):
         factory = getattr(factory, part)
