@@ -29,13 +29,13 @@ sam2:
   multimask_output: false
 
 detection_adapter:
-  checkpoint_path: ""
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
   feature_dim: 1024
   num_classes: 91
   score_threshold: 0.25
 
 segmentation_adapter:
-  checkpoint_path: ""
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
   feature_dim: 1024
   num_classes: 150
 
