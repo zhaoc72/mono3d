@@ -441,13 +441,19 @@ def _process_adapter_sample(
     grid_size_tuple = (int(grid_size[0]), int(grid_size[1]))
     processed_hw = (processed_shape[1], processed_shape[0])
 
+    patch_tokens_raw = features.get("patch_tokens_raw")
+    if isinstance(patch_tokens_raw, np.ndarray):
+        adapter_tokens = patch_tokens_raw
+    else:
+        adapter_tokens = features["patch_tokens"]
+
     detection = detection_adapter.predict(
-        features["patch_tokens"],
+        adapter_tokens,
         image_size=processed_hw,
         grid_size=grid_size_tuple,
     )
     segmentation = segmentation_adapter.predict(
-        features["patch_tokens"],
+        adapter_tokens,
         image_size=processed_hw,
         grid_size=grid_size_tuple,
     )
