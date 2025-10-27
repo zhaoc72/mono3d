@@ -1,26 +1,28 @@
 device: "cuda"
-dtype: "float16"
+dtype: "float32"
 
 dinov3:
   repo_or_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
   model_name: "dinov3_vitl16"
   use_torch_hub: true
   torchhub_source: "local"
-  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+  checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_lvd1689m.pth"
   image_size: 448
   patch_size: 16
 
   output_layers: [4, 8, 12]
   layer_weights: [0.2, 0.3, 0.5]
-  fusion_method: "concat"
+  fusion_method: "weighted_sum"
 
   enable_pca: true
   pca_dim: 32
+
   enable_objectness: true
   objectness_smoothing_kernel: 3
-  objectness_contrast_gamma: 0.85
+  objectness_contrast_gamma: 0.7
+
   append_positional_features: true
-  positional_feature_scale: 0.12
+  positional_feature_scale: 0.25
 
 sam2:
   backend: "official"
@@ -47,13 +49,13 @@ pipeline:
   objectness_weight: 0.6
   confidence_weight: 0.3
   area_weight: 0.1
-  min_mask_objectness: 0.45
+  min_mask_objectness: 0.35
   min_mask_area: 120
 
   use_superpixels: true
   superpixel:
     method: "slic"
-    n_segments: 1200
+    n_segments: 1500
     compactness: 12.0
     sigma: 1.0
   auto_superpixel:
@@ -66,9 +68,9 @@ pipeline:
   use_graph_clustering: false
   use_density_clustering: true
   density_cluster:
-    method: "hdbscan"
-    min_cluster_size: 60
-    min_samples: 20
+    method: "meanshift"
+    min_cluster_size: 30
+    min_samples: 10
     cluster_selection_epsilon: 0.0
     metric: "euclidean"
     allow_single_cluster: false
@@ -83,13 +85,13 @@ pipeline:
     bi_rgb_std: 5.0
 
   cluster:
-    clustering_method: "hdbscan"
+    clustering_method: "adaptive"
 
     # Fixed方法参数（仅当clustering_method="fixed"时使用）
     num_clusters: 6
 
     # Adaptive方法参数
-    min_clusters: 6
+    min_clusters: 4
     max_clusters: 30
     cluster_selection_method: "silhouette"
 
@@ -103,21 +105,22 @@ pipeline:
     max_instances_per_cluster: 12
 
     use_objectness_filter: true
-    objectness_threshold: 0.45
+    objectness_threshold: 0.35
     objectness_weight: 0.5
     apply_objectness_mask: true
-    objectness_mask_threshold: 0.45
-    objectness_min_keep_patches: 72
-    objectness_percentile: 0.7
-    objectness_min_std: 0.015
-    objectness_dynamic_floor: 0.35
+    objectness_mask_threshold: 0.35
+    objectness_min_keep_patches: 150
+    objectness_percentile: 0.6
+    objectness_min_std: 0.01
+    objectness_dynamic_floor: 0.3
 
     use_connected_components: true
     min_component_area: 120
     foreground_only: true
     max_background_ratio: 0.8
+
     merge_small_clusters: true
-    min_cluster_size: 72
+    min_cluster_size: 30
     merge_similar_clusters: true
     similarity_threshold: 0.9
     min_similarity_cluster_size: 200
@@ -125,8 +128,8 @@ pipeline:
     edge_background_area_ratio: 0.18
     edge_touch_ratio: 0.32
 
-    hdbscan_min_cluster_size: 60
-    hdbscan_min_samples: 20
+    hdbscan_min_cluster_size: 30
+    hdbscan_min_samples: 10
     hdbscan_metric: "euclidean"
     hdbscan_allow_single_cluster: false
     hdbscan_cluster_selection_epsilon: 0.0

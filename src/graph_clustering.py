@@ -253,27 +253,45 @@ def merge_small_clusters(
     if len(small_clusters) == 0:
         return labels
     
+    # 如果没有大聚类，则无法合并，直接返回原标签
+    if len(large_clusters) == 0:
+        LOGGER.warning(
+            f"All {len(unique_labels)} clusters are smaller than min_cluster_size={min_cluster_size}; "
+            "cannot merge small clusters"
+        )
+        return labels
+    
     # 计算大聚类的质心
     centroids = []
     for label in large_clusters:
         mask = labels == label
+        if not np.any(mask):
+            continue
         centroid = features[mask].mean(axis=0)
         centroids.append(centroid)
+    
+    if len(centroids) == 0:
+        LOGGER.warning("No valid large cluster centroids computed; cannot merge small clusters")
+        return labels
+    
     centroids = np.array(centroids)
     
     # 合并小聚类
     new_labels = labels.copy()
     for small_label in small_clusters:
         mask = labels == small_label
+        if not np.any(mask):
+            continue
         small_features = features[mask]
         small_centroid = small_features.mean(axis=0)
         
         # 找最近的大聚类
         distances = np.linalg.norm(centroids - small_centroid[None, :], axis=1)
-        nearest_large_label = large_clusters[distances.argmin()]
+        nearest_idx = distances.argmin()
+        nearest_large_label = large_clusters[nearest_idx]
         
         new_labels[mask] = nearest_large_label
     
-    LOGGER.info(f"Merged {len(small_clusters)} small clusters")
+    LOGGER.info(f"Merged {len(small_clusters)} small clusters into {len(large_clusters)} large clusters")
     
     return new_labels
