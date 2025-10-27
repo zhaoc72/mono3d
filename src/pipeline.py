@@ -185,6 +185,7 @@ class ForegroundSegmentationPipeline:
             objectness_map=features.get("objectness_map"),
             processed_shape=processed_shape,
             original_shape=image.shape[:2],
+            original_image=image.copy(),
             attention_map=features.get("attention_map"),
             patch_map=features.get("patch_map"),
             fusion_debug=fusion_debug,

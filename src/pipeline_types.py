@@ -86,6 +86,7 @@ class PipelineResult:
     objectness_map: Optional[np.ndarray]
     processed_shape: Tuple[int, int]
     original_shape: Tuple[int, int]
+    original_image: np.ndarray
     attention_map: Optional[np.ndarray] = None
     patch_map: Optional[np.ndarray] = None
     fusion_debug: Optional[object] = None
