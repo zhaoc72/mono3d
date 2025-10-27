@@ -1,40 +1,47 @@
 # ===================================
-# Mono3D Zero-Shot Segmentation Config
+# Mono3D DINOv3 可视化配置 - 优化版
+# 更低的阈值以获得更多检测结果
 # ===================================
 
 dinov3:
   repo_path: "/media/pc/D/zhaochen/mono3d/dinov3"
   model_name: "dinov3_vitl16"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_lvd1689m.pth"
-  image_size: 448
-  output_layers: [4, 8, 12]
+  image_size: 518
+  output_layers: [11, 17, 23]  # For ViT-L/16, use later layers
   layer_weights: [0.2, 0.3, 0.5]
   fusion_method: "weighted_sum"
-  enable_pca: true
+  enable_pca: false
   pca_dim: 32
   enable_objectness: true
   objectness_smoothing_kernel: 3
   objectness_contrast_gamma: 0.7
-  append_positional_features: true
+  append_positional_features: false
   positional_feature_scale: 0.25
+  patch_size: 16
   dtype: "float32"
   device: "cuda"
 
 sam2:
   backend: "official"
-  checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
-  model_config: "sam2.1/sam2.1_hiera_l"
+  checkpoint_path: ""
+  model_config: ""
   max_batch_size: 16
   mask_selection_strategy: "best_balanced"
   multimask_output: false
 
 detection_adapter:
+  # 注意：这些权重可能是完整的ViT-7B模型，不只是detection head
+  # 如果加载失败，会使用随机初始化的权重
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
   feature_dim: 1024
   num_classes: 91
-  score_threshold: 0.25
+  # 🔥 降低阈值以获得更多检测
+  score_threshold: 0.05  # 从0.25降到0.05
 
 segmentation_adapter:
+  # 注意：这些权重可能是完整的ViT-7B模型，不只是segmentation head
+  # 如果加载失败，会使用随机初始化的权重
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
   feature_dim: 1024
   num_classes: 150
@@ -42,7 +49,7 @@ segmentation_adapter:
 fusion:
   objectness_threshold: 0.45
   segmentation_threshold: 0.35
-  detection_score_threshold: 0.25
+  detection_score_threshold: 0.05  # 降低阈值
   min_instance_area: 60
   dilation_kernel: 3
   nms_iou_threshold: 0.6
@@ -53,7 +60,7 @@ prompts:
   include_masks: true
   max_points_per_region: 3
   grid_points_per_side: 0
-  min_score: 0.15
+  min_score: 0.05  # 降低阈值
   max_prompts: 80
   max_prompts_per_class: 20
   nms_iou_threshold: 0.5
@@ -67,4 +74,3 @@ postprocess:
   closing_kernel: 5
   opening_kernel: 3
   min_instance_area: 60
-
