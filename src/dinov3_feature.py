@@ -383,18 +383,27 @@ class Dinov3Backbone:
         layer_patch_tokens = [pair[0].squeeze(0) for pair in separated]  # List of [P, D_i]
         layer_cls_tokens = [pair[1].squeeze(0) for pair in separated]     # List of [D_i]
 
+        if not layer_patch_tokens:
+            raise RuntimeError("No patch tokens were extracted from the backbone outputs")
+
+        # 为官方适配器保留来自最深层的原始特征（未归一化、未降维）
+        fusion_inputs: List[torch.Tensor] = []
+        for tokens in layer_patch_tokens:
+            tokens_float = tokens.to(dtype=torch.float32)
+            tokens_float = torch.nan_to_num(tokens_float, nan=0.0, posinf=0.0, neginf=0.0)
+            fusion_inputs.append(tokens_float)
+
+        raw_patch_tokens = fusion_inputs[-1].clone().contiguous()
+
         # 多层特征融合
-        LOGGER.debug(f"Fusing {len(layer_patch_tokens)} layers with method: {self.config.fusion_method}")
-        fused_patch_tokens = self._fuse_multilayer_features(layer_patch_tokens)
+        LOGGER.debug(f"Fusing {len(fusion_inputs)} layers with method: {self.config.fusion_method}")
+        fused_patch_tokens = self._fuse_multilayer_features(fusion_inputs)
 
         # 使用 float32 以确保聚类稳定，并清除潜在的非有限值
         fused_patch_tokens = fused_patch_tokens.to(dtype=torch.float32)
         fused_patch_tokens = torch.nan_to_num(
             fused_patch_tokens, nan=0.0, posinf=0.0, neginf=0.0
         )
-
-        # 在降维之前缓存原始的高维特征，便于加载官方适配器权重
-        raw_patch_tokens = fused_patch_tokens.detach().clone()
 
         objectness_tokens = (
             fused_patch_tokens.clone() if self.config.enable_objectness else None
