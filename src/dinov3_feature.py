@@ -392,6 +392,10 @@ class Dinov3Backbone:
         fused_patch_tokens = torch.nan_to_num(
             fused_patch_tokens, nan=0.0, posinf=0.0, neginf=0.0
         )
+
+        # 在降维之前缓存原始的高维特征，便于加载官方适配器权重
+        raw_patch_tokens = fused_patch_tokens.detach().clone()
+
         objectness_tokens = (
             fused_patch_tokens.clone() if self.config.enable_objectness else None
         )
@@ -402,7 +406,8 @@ class Dinov3Backbone:
         if self.config.enable_pca:
             fused_patch_tokens = self._apply_pca(fused_patch_tokens)
 
-        fused_patch_tokens = fused_patch_tokens.detach().cpu()
+        fused_patch_tokens_cpu = fused_patch_tokens.detach().cpu()
+        raw_patch_tokens_cpu = raw_patch_tokens.detach().cpu()
 
         cls_tokens = (
             torch.stack(layer_cls_tokens, dim=0)
@@ -412,7 +417,7 @@ class Dinov3Backbone:
         )
 
         # 计算 grid size
-        num_tokens = fused_patch_tokens.shape[0]
+        num_tokens = fused_patch_tokens_cpu.shape[0]
         patch_size = max(1, int(getattr(self.config, "patch_size", 1)))
         tokens_h = processed_height // patch_size
         tokens_w = processed_width // patch_size
@@ -437,7 +442,7 @@ class Dinov3Backbone:
                 )
 
         # 重塑为 spatial map
-        patch_map = fused_patch_tokens.reshape(tokens_h, tokens_w, -1)
+        patch_map = fused_patch_tokens_cpu.reshape(tokens_h, tokens_w, -1)
 
         # 获取 attention map
         attention = self._gather_attention(inputs)
@@ -515,14 +520,16 @@ class Dinov3Backbone:
                 grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
                 coord_map = torch.stack((grid_y, grid_x), dim=-1) * scale
                 patch_map = torch.cat([patch_map, coord_map], dim=-1)
-                fused_patch_tokens = patch_map.reshape(-1, patch_map.shape[-1])
+                fused_patch_tokens_cpu = patch_map.reshape(-1, patch_map.shape[-1])
 
-        patch_tokens_np = fused_patch_tokens.numpy()
+        patch_tokens_np = fused_patch_tokens_cpu.numpy()
+        patch_tokens_raw_np = raw_patch_tokens_cpu.numpy()
         patch_map_np = patch_map.numpy()
         cls_token_np = cls_tokens.numpy()
 
         return {
             "patch_tokens": patch_tokens_np,
+            "patch_tokens_raw": patch_tokens_raw_np,
             "cls_token": cls_token_np,
             "grid_size": (tokens_h, tokens_w),
             "patch_map": patch_map_np,

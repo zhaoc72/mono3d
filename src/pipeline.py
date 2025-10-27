@@ -111,7 +111,7 @@ class ForegroundSegmentationPipeline:
 
         LOGGER.info("Extracting DINOv3 features...")
         features = self.backbone.extract_features(image)
-        patch_tokens = features["patch_tokens"]
+        patch_tokens = features.get("patch_tokens_raw") or features["patch_tokens"]
         grid_size = features["grid_size"]
         processed_shape = features["processed_image_shape"]
         processed_hw = (processed_shape[1], processed_shape[0])

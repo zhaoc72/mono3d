@@ -243,15 +243,22 @@ def _save_adapter_metadata(
     features: Dict[str, object],
 ) -> None:
     patch_tokens = features.get("patch_tokens")
+    patch_tokens_raw = features.get("patch_tokens_raw")
     feature_dim = 0
+    reduced_dim = 0
     if isinstance(patch_tokens, np.ndarray) and patch_tokens.ndim == 2:
-        feature_dim = int(patch_tokens.shape[-1])
+        reduced_dim = int(patch_tokens.shape[-1])
+    if isinstance(patch_tokens_raw, np.ndarray) and patch_tokens_raw.ndim == 2:
+        feature_dim = int(patch_tokens_raw.shape[-1])
+    elif reduced_dim:
+        feature_dim = reduced_dim
 
     metadata: Dict[str, object] = {
         "image": image_path,
         "grid_size": [int(x) for x in features.get("grid_size", (0, 0))],
         "processed_image_shape": [int(x) for x in features.get("processed_image_shape", (0, 0))],
         "feature_dim": feature_dim,
+        "reduced_feature_dim": reduced_dim,
         "num_detections": int(detection.boxes.shape[0]),
         "num_segmentation_classes": int(segmentation.logits.shape[0]),
     }
