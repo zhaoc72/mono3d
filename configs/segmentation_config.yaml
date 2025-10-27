@@ -1,0 +1,13 @@
+# Segmentation adapter configuration for ADE20K
+
+MODEL:
+  TYPE: "linear"
+  NUM_CLASSES: 150  # ADE20K has 150 classes
+  IN_CHANNELS: 1024  # DINOv3 ViT-L/16 feature dimension
+  
+SEGMENTATION:
+  ACTIVATION: "sigmoid"
+  INTERPOLATE_MODE: "bilinear"
+  
+INPUT:
+  FEATURE_DIM: 1024  # DINOv3 ViT-L/16 feature dimension

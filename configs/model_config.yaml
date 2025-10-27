@@ -86,16 +86,10 @@ pipeline:
 
   cluster:
     clustering_method: "adaptive"
-
-    # Fixed方法参数（仅当clustering_method="fixed"时使用）
     num_clusters: 6
-
-    # Adaptive方法参数
     min_clusters: 4
     max_clusters: 30
     cluster_selection_method: "silhouette"
-
-    # 通用参数
     max_iterations: 40
     random_state: 0
     min_region_area: 100
@@ -170,19 +164,22 @@ reconstruction:
   metadata_keys: []
   mask_extension: ".npy"
 
+# ========================================
+# 类别感知配置 - 使用本地 adapters
+# ========================================
 class_aware:
-  enable: null  # 留空表示当检测/分割 adapter 都配置后自动启用（零训练 Zero-Shot 模式）
+  enable: null  # 自动启用（当两个 adapter 都配置时）
   detection_adapter:
-    target: "dinov3.adapters.detection:build_coco_adapter"  # 使用官方 DINOv3 COCO DETR adapter
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
-    python_paths:
-      - "/media/pc/D/zhaochen/mono3d/dinov3"  # 指向本地克隆的 DINOv3 仓库
+    # 使用本地 src.adapters.detection 模块
+    target: "src.adapters.detection:build_coco_adapter"
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_coco.pth"
+    python_paths: []  # 不需要额外的 python paths，因为使用本地模块
     kwargs: {}
   segmentation_adapter:
-    target: "dinov3.adapters.segmentation:build_ade20k_adapter"  # 使用官方 ADE20K 语义分割 adapter
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
-    python_paths:
-      - "/media/pc/D/zhaochen/mono3d/dinov3"
+    # 使用本地 src.adapters.segmentation 模块
+    target: "src.adapters.segmentation:build_ade20k_adapter"
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_ade20k.pth"
+    python_paths: []
     kwargs: {}
   prompt_fusion:
     objectness_threshold: 0.45
@@ -203,5 +200,5 @@ class_aware:
     closing_kernel: 5
     opening_kernel: 3
     min_instance_area: 60
-  foreground_class_ids: null
-  background_class_ids: [0]
+  foreground_class_ids: null  # null 表示自动检测所有前景类别
+  background_class_ids: [0]  # ADE20K 的 background 类别
