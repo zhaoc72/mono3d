@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 修复版 DINOv3 可视化脚本
-专门支持 ViT-7B/16 模型和正确的路径配置
+新增：检测框和分割结果的可视化保存
 """
 
 import argparse
@@ -59,6 +59,99 @@ def save_heatmap(map_2d: np.ndarray, output_path: Path, base_image: np.ndarray =
         cv2.imwrite(str(overlay_path), overlay)
         print(f"   ✅ Saved: {overlay_path.name}")
 
+def save_detection_visualization(detection, image_rgb, processed_shape, output_dir):
+    """保存检测框可视化"""
+    print(f"\n💾 Saving detection visualization...")
+    det_vis_bgr = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
+    
+    # 计算缩放比例
+    scale_x = image_rgb.shape[1] / processed_shape[1]
+    scale_y = image_rgb.shape[0] / processed_shape[0]
+    
+    # 定义颜色调色板
+    colors = [
+        (240, 86, 60), (67, 160, 71), (66, 133, 244), 
+        (171, 71, 188), (255, 202, 40), (38, 198, 218),
+        (255, 112, 67), (124, 179, 66)
+    ]
+    
+    for idx, (box, score, class_id) in enumerate(zip(
+        detection.boxes, detection.scores, detection.class_ids
+    )):
+        # 缩放框坐标
+        x1 = int(box[0] * scale_x)
+        y1 = int(box[1] * scale_y)
+        x2 = int(box[2] * scale_x)
+        y2 = int(box[3] * scale_y)
+        
+        # 裁剪到图像边界
+        x1 = max(0, min(det_vis_bgr.shape[1] - 1, x1))
+        y1 = max(0, min(det_vis_bgr.shape[0] - 1, y1))
+        x2 = max(0, min(det_vis_bgr.shape[1] - 1, x2))
+        y2 = max(0, min(det_vis_bgr.shape[0] - 1, y2))
+        
+        # 选择颜色
+        color = colors[idx % len(colors)]
+        
+        # 绘制边界框
+        cv2.rectangle(det_vis_bgr, (x1, y1), (x2, y2), color, 2)
+        
+        # 添加标签
+        class_name = detection.class_names[int(class_id)] if detection.class_names else str(int(class_id))
+        label = f"{class_name}:{score:.2f}"
+        cv2.putText(
+            det_vis_bgr, label, (x1, max(15, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA
+        )
+    
+    detection_path = output_dir / "detections.png"
+    cv2.imwrite(str(detection_path), det_vis_bgr)
+    print(f"   ✅ Saved: {detection_path.name}")
+
+def save_segmentation_visualization(segmentation, image_rgb, processed_shape, output_dir):
+    """保存分割结果可视化"""
+    print(f"\n💾 Saving segmentation visualization...")
+    
+    # 计算概率（sigmoid激活）
+    logits = segmentation.logits.astype(np.float32)
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    
+    # 获取最大概率的类别
+    class_indices = probs.argmax(axis=0)
+    class_scores = probs.max(axis=0)
+    
+    # 创建彩色分割图（使用随机颜色）
+    np.random.seed(42)
+    palette = np.random.randint(0, 255, size=(150, 3), dtype=np.uint8)
+    palette[0] = [0, 0, 0]  # 背景为黑色
+    
+    color_map = palette[class_indices].astype(np.uint8)
+    
+    # 调整大小到原始图像尺寸
+    if color_map.shape[:2] != image_rgb.shape[:2]:
+        color_map = cv2.resize(
+            color_map,
+            (image_rgb.shape[1], image_rgb.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+    
+    # 保存分割图
+    seg_path = output_dir / "segmentation_map.png"
+    cv2.imwrite(str(seg_path), cv2.cvtColor(color_map, cv2.COLOR_RGB2BGR))
+    print(f"   ✅ Saved: {seg_path.name}")
+    
+    # 保存叠加图
+    base_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    color_bgr = cv2.cvtColor(color_map, cv2.COLOR_RGB2BGR)
+    overlay = cv2.addWeighted(base_bgr, 0.6, color_bgr, 0.4, 0.0)
+    overlay_path = output_dir / "segmentation_overlay.png"
+    cv2.imwrite(str(overlay_path), overlay)
+    print(f"   ✅ Saved: {overlay_path.name}")
+    
+    # 保存前景概率热力图
+    foreground_prob = class_scores
+    save_heatmap(foreground_prob, output_dir / "segmentation_foreground", image_rgb)
+
 def main():
     parser = argparse.ArgumentParser(
         description="可视化 DINOv3 backbone 和 adapter 输出"
@@ -80,7 +173,7 @@ def main():
     
     # 加载配置
     print("=" * 70)
-    print("DINOv3 Visualization (ViT-7B/16)")
+    print("DINOv3 Visualization (ViT-7B/16) - Fixed Version")
     print("=" * 70)
     print(f"\n📖 Loading config: {args.config}")
     
@@ -232,6 +325,9 @@ def main():
         print(f"   ✅ Detection complete: {len(detection.boxes)} boxes")
         if len(detection.boxes) > 0:
             print(f"      Score range: [{detection.scores.min():.3f}, {detection.scores.max():.3f}]")
+            
+            # 🆕 保存检测可视化
+            save_detection_visualization(detection, image_rgb, processed_shape, output_dir)
     
     # Segmentation Adapter
     segmentation_config_dict = model_section.get('segmentation_adapter', {})
@@ -265,6 +361,9 @@ def main():
         print(f"   ✅ Segmentation complete")
         print(f"      Logits shape: {segmentation.logits.shape}")
         print(f"      Logits range: [{segmentation.logits.min():.3f}, {segmentation.logits.max():.3f}]")
+        
+        # 🆕 保存分割可视化
+        save_segmentation_visualization(segmentation, image_rgb, processed_shape, output_dir)
     
     # 保存元数据
     import json
@@ -295,10 +394,11 @@ def main():
         print(f"   - objectness.png / objectness_overlay.png")
     if attention_map is not None:
         print(f"   - attention.png / attention_overlay.png")
-    if 'detection' in locals():
-        print(f"   - Detection: {len(detection.boxes)} boxes")
+    if 'detection' in locals() and len(detection.boxes) > 0:
+        print(f"   - detections.png ({len(detection.boxes)} boxes)")
     if 'segmentation' in locals():
-        print(f"   - Segmentation: {segmentation.logits.shape[0]} classes")
+        print(f"   - segmentation_map.png / segmentation_overlay.png")
+        print(f"   - segmentation_foreground.png / segmentation_foreground_overlay.png")
     print(f"   - metadata.json")
 
 if __name__ == "__main__":

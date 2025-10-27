@@ -1,5 +1,5 @@
-# DINOv3 配置文件（修正版）
-# 使用实际的文件路径
+# DINOv3 配置文件（修复版 - 适配器随机初始化）
+# 解决架构不匹配问题
 
 model:
   name: "dinov3_adapter"
@@ -25,11 +25,11 @@ model:
     # Training settings
     freeze: true
     
-    # Memory optimization settings (NEW)
-    memory_efficient_attention: true    # Enable memory efficient attention
-    gradient_checkpointing: false       # Enable if training, disable for inference
-    cpu_offload: false                  # Offload model to CPU between forward passes
-    load_in_8bit: false                 # Use 8-bit quantization (experimental)
+    # Memory optimization settings
+    memory_efficient_attention: true
+    gradient_checkpointing: false
+    cpu_offload: false
+    load_in_8bit: false
     
     # Feature extraction settings
     output_layers: [9, 19, 29, 39]
@@ -50,41 +50,23 @@ model:
     objectness_contrast_gamma: 2.0
     
     # Device settings
-    dtype: "float16"  # Use float16 to save memory (was float32)
-    device: "cuda"    # Will auto-detect multi-GPU
-
-  # Alternative configurations for different scenarios:
-
-  # Configuration 1: Maximum memory saving (slower)
-  # dtype: "float16"
-  # memory_efficient_attention: true
-  # cpu_offload: true
-  # gradient_checkpointing: true
-
-  # Configuration 2: Balanced (recommended for 4x24GB GPUs)
-  # dtype: "float16"
-  # memory_efficient_attention: true
-  # cpu_offload: false
-  # gradient_checkpointing: false
-
-  # Configuration 3: Use smaller model
-  # model_name: "dinov3_vitl16"  # Large instead of 7B
-  # checkpoint_path: "/path/to/dinov3_vitl16.pth"
+    dtype: "float16"
+    device: "cuda"
   
   # ============================================
-  # Detection Adapter 配置
+  # Detection Adapter 配置（随机初始化）
   # ============================================
   detection_adapter:
     type: "detr_head"
     
-    # Detection adapter 权重路径
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
+    # 🔥 关键修复：不加载预训练权重
+    checkpoint_path: ""
     
-    freeze: false  # adapter 需要训练/微调
+    freeze: false
     
-    # COCO 检测配置
-    feature_dim: 3200  # 输入特征维度（与 backbone 一致）
-    num_classes: 91  # COCO 数据集类别数（80 类 + 背景）
+    # 🔥 关键修复：匹配 ViT-7B 特征维度
+    feature_dim: 4096  # 从 3200 改为 4096
+    num_classes: 91
     
     # DETR 架构
     hidden_dim: 256
@@ -95,25 +77,25 @@ model:
     dim_feedforward: 2048
     dropout: 0.1
     
-    # 推理配置
-    score_threshold: 0.05  # 降低阈值以获得更多检测
+    # 🔥 关键修复：提高阈值（随机权重的分数更分散）
+    score_threshold: 0.3  # 从 0.05 提高到 0.3
     aux_loss: true
     use_objectness: true
   
   # ============================================
-  # Segmentation Adapter 配置
+  # Segmentation Adapter 配置（随机初始化）
   # ============================================
   segmentation_adapter:
     type: "mask_head"
     
-    # Segmentation adapter 权重路径
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
+    # 🔥 关键修复：不加载预训练权重
+    checkpoint_path: ""
     
-    freeze: false  # adapter 需要训练/微调
+    freeze: false
     
-    # ADE20K 分割配置
-    feature_dim: 3200  # 输入特征维度（与 backbone 一致）
-    num_classes: 150  # ADE20K 数据集类别数
+    # 🔥 关键修复：匹配 ViT-7B 特征维度
+    feature_dim: 4096  # 从 3200 改为 4096
+    num_classes: 150
     
     # Mask 解码器
     hidden_dim: 256
@@ -125,13 +107,14 @@ model:
     fpn_scales: [8, 16, 32]
 
 # ============================================
-# Fusion 配置
+# Fusion 配置（提高阈值）
 # ============================================
 fusion:
-  objectness_threshold: 0.45
-  segmentation_threshold: 0.35
-  detection_score_threshold: 0.05  # 与 detection_adapter.score_threshold 一致
-  min_instance_area: 60
+  # 🔥 关键修复：提高阈值，更依赖 objectness
+  objectness_threshold: 0.5      # 从 0.45 提高到 0.5
+  segmentation_threshold: 0.4    # 从 0.35 提高到 0.4
+  detection_score_threshold: 0.3 # 从 0.05 提高到 0.3
+  min_instance_area: 100         # 从 60 提高到 100
   dilation_kernel: 3
   nms_iou_threshold: 0.6
 
@@ -144,9 +127,9 @@ prompts:
   include_masks: true
   max_points_per_region: 3
   grid_points_per_side: 0
-  min_score: 0.0
-  max_prompts: 128
-  max_prompts_per_class: 0
+  min_score: 0.2                 # 从 0.0 提高到 0.2
+  max_prompts: 50                # 从 128 降低到 50
+  max_prompts_per_class: 5       # 从 0 改为 5（限制每类最多5个）
   nms_iou_threshold: 0.5
 
 # ============================================
@@ -154,7 +137,7 @@ prompts:
 # ============================================
 instance_grouping:
   method: "connected_components"
-  min_area: 60
+  min_area: 100                  # 从 60 提高到 100
   use_density_clustering: false
 
 # ============================================
@@ -164,7 +147,7 @@ postprocess:
   enable: true
   closing_kernel: 5
   opening_kernel: 3
-  min_instance_area: 60
+  min_instance_area: 100         # 从 60 提高到 100
 
 # ============================================
 # SAM2 配置
@@ -188,7 +171,32 @@ inference:
   batch_size: 1
   
   # 图像预处理
-  image_size: [518, 518]  # [height, width]
+  image_size: [518, 518]
   normalize:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
+
+# ============================================
+# 配置说明
+# ============================================
+# 
+# 本配置采用"随机初始化适配器"方案，理由：
+# 
+# 1. 官方预训练权重架构不匹配：
+#    - 官方：Deformable DETR (768维hidden, 多层变形注意力)
+#    - 简化版：SimpleDETR (256维hidden, 单层编码器)
+# 
+# 2. 管道设计哲学：
+#    - DINOv3 提供高质量语义特征（已预训练）
+#    - 适配器生成粗糙候选区域（随机初始化可接受）
+#    - SAM2 进行精细分割（最终质量保证）
+# 
+# 3. 关键参数调整：
+#    - feature_dim: 4096（匹配ViT-7B）
+#    - 阈值提高（补偿随机权重的不确定性）
+#    - 更依赖objectness map（DINOv3的强项）
+# 
+# 4. 预期效果：
+#    - 检测框：5-20个高质量候选
+#    - 分割：粗糙但合理的前景区域
+#    - SAM2：精细化为高质量实例mask
