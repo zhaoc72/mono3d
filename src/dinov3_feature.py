@@ -1,109 +1,38 @@
 """Lightweight DINOv3 feature extraction for zero-shot prompt generation."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple, List
+import os
+import sys
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
+from .config import Dinov3BackboneConfig
 from .utils import LOGGER
 
 
-@dataclass
-class Dinov3Config:
-    """Configuration describing how to load and query a DINOv3 backbone."""
+class Dinov3Backbone:
+    """Wrapper that exposes patch embeddings and attention maps from the official DINOv3 repo."""
 
-    repo_or_dir: str = "facebookresearch/dinov2"
-    model_name: str = "dinov2_vitl14"
-    use_torch_hub: bool = True
-    checkpoint_path: Optional[str] = None
-    image_size: int = 518
-    output_layers: Sequence[int] = (4, 8, 12)  # 多层特征
-    patch_size: int = 14
-    normalize: bool = True
-    torchhub_source: Optional[str] = None
-    output_layer: Optional[int] = None
-    
-    # 新增：多层特征融合配置
-    layer_weights: Optional[Sequence[float]] = None  # 层权重，如 (0.3, 0.3, 0.4)
-    fusion_method: str = "weighted_concat"  # weighted_concat, weighted_sum, concat
-    enable_pca: bool = False  # 是否启用 PCA 降维
-    pca_dim: int = 32  # PCA 降维目标维度
-    enable_objectness: bool = True  # 是否计算对象性评分
-    objectness_smoothing_kernel: int = 1  # 对象性图平滑核尺寸（奇数，<=1 表示禁用）
-    objectness_contrast_gamma: float = 1.0  # 对象性图的伽马调整（<1 提升对比度）
-    append_positional_features: bool = True  # 是否附加显式的坐标特征
-    positional_feature_scale: float = 0.1  # 坐标特征的缩放系数
-
-    def __post_init__(self) -> None:
-        """Normalize legacy configuration options."""
-
-        layers: Sequence[int]
-        if isinstance(self.output_layers, int):
-            layers = (self.output_layers,)
-        elif isinstance(self.output_layers, (list, tuple)):
-            layers = tuple(self.output_layers)
-        else:
-            layers = tuple(self.output_layers)
-
-        if self.output_layer is not None:
-            layers = (self.output_layer,)
-
-        normalized: list[int] = []
-        for index, layer in enumerate(layers):
-            if layer < 0:
-                layer = -layer - 1
-            if layer < 0:
-                raise ValueError(
-                    f"Invalid output layer specification at position {index}: {layers}"
-                )
-            normalized.append(int(layer))
-
-        object.__setattr__(self, "output_layers", tuple(normalized))
-        object.__setattr__(self, "output_layer", None)
-        
-        # 初始化层权重
-        if self.layer_weights is None:
-            n_layers = len(self.output_layers)
-            # 默认：后面的层权重更大
-            weights = [0.2 + 0.3 * (i / max(1, n_layers - 1)) for i in range(n_layers)]
-            weights = [w / sum(weights) for w in weights]  # 归一化
-            object.__setattr__(self, "layer_weights", tuple(weights))
-        else:
-            # 验证权重
-            if len(self.layer_weights) != len(self.output_layers):
-                raise ValueError(
-                    f"layer_weights length {len(self.layer_weights)} must match "
-                    f"output_layers length {len(self.output_layers)}"
-                )
-            # 归一化权重
-            weights = list(self.layer_weights)
-            total = sum(weights)
-            if total > 0:
-                weights = [w / total for w in weights]
-            object.__setattr__(self, "layer_weights", tuple(weights))
-
-        scale = float(getattr(self, "positional_feature_scale", 0.0) or 0.0)
-        if scale < 0.0:
-            scale = 0.0
-        object.__setattr__(self, "positional_feature_scale", float(scale))
-
-
-class DINOv3FeatureExtractor:
-    """Wrapper that exposes patch embeddings and attention maps from DINOv3."""
-
-    def __init__(self, config: Dinov3Config, device: torch.device | str, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        config: Dinov3BackboneConfig,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> None:
         self.config = config
         self.device = torch.device(device)
         self.dtype = dtype
+        self.output_layers = self._normalize_layers(config.output_layers)
+        self.layer_weights = self._normalize_weights(config.layer_weights, len(self.output_layers))
+        self.repo_path = self._register_repo(config.repo_path)
         self.model = self._load_model()
         self.model.eval()
-        
+
         # PCA 组件（延迟初始化）
         self.pca = None
         self.pca_fitted = False
@@ -112,30 +41,82 @@ class DINOv3FeatureExtractor:
             transforms.ToPILImage(),
             transforms.Resize((config.image_size, config.image_size)),
             transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
-        if config.normalize:
-            transform_steps.append(
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            )
         self.transform = transforms.Compose(transform_steps)
-    
-    def _load_model(self) -> torch.nn.Module:
-        if self.config.use_torch_hub:
-            LOGGER.info(
-                "Loading DINOv3 weights %s from %s", self.config.model_name, self.config.repo_or_dir
-            )
-            source = self.config.torchhub_source
-            if source is None:
-                source = "local" if self._is_local_repo(self.config.repo_or_dir) else "github"
-            kwargs = {
-                "trust_repo": True,
-                "source": source,
-                "pretrained": self.config.checkpoint_path is None,
-            }
-            model = torch.hub.load(self.config.repo_or_dir, self.config.model_name, **kwargs)
+
+    @staticmethod
+    def _normalize_layers(layers: Sequence[int]) -> Tuple[int, ...]:
+        normalized: List[int] = []
+        for index, layer in enumerate(layers):
+            value = int(layer)
+            if value < 0:
+                value = -value - 1
+            if value < 0:
+                raise ValueError(
+                    f"Invalid output layer specification at position {index}: {layers}"
+                )
+            normalized.append(value)
+        return tuple(normalized)
+
+    @staticmethod
+    def _normalize_weights(
+        weights: Optional[Sequence[float]],
+        num_layers: int,
+    ) -> Tuple[float, ...]:
+        if weights is None:
+            base = [0.2 + 0.3 * (i / max(1, num_layers - 1)) for i in range(num_layers)]
         else:
-            module = __import__(self.config.repo_or_dir, fromlist=[self.config.model_name])
-            model = getattr(module, self.config.model_name)
+            if len(weights) != num_layers:
+                raise ValueError(
+                    f"layer_weights length {len(weights)} must match output_layers length {num_layers}"
+                )
+            base = [float(value) for value in weights]
+        total = sum(base)
+        if total <= 0:
+            return tuple(1.0 / num_layers for _ in range(num_layers))
+        return tuple(value / total for value in base)
+
+    @staticmethod
+    def _register_repo(repo_path: Optional[str]) -> Optional[str]:
+        if not repo_path:
+            return None
+        expanded = os.path.abspath(os.path.expanduser(repo_path))
+        if os.path.isdir(expanded) and expanded not in sys.path:
+            sys.path.insert(0, expanded)
+        return expanded if os.path.isdir(expanded) else None
+
+    def _load_model(self) -> torch.nn.Module:
+        repo = self.repo_path or "facebookresearch/dinov3"
+        source = "local" if self.repo_path else "github"
+        LOGGER.info("Loading DINOv3 weights %s from %s", self.config.model_name, repo)
+
+        model: Optional[torch.nn.Module] = None
+        try:
+            model = torch.hub.load(
+                repo,
+                self.config.model_name,
+                trust_repo=True,
+                source=source,
+                pretrained=self.config.checkpoint_path is None,
+            )
+        except Exception as hub_error:  # pragma: no cover - torch hub may be unavailable
+            LOGGER.warning("Torch Hub loading failed: %s", hub_error)
+            try:
+                import importlib
+
+                module = importlib.import_module("dinov3.models.vision_transformer")
+                constructor = getattr(module, self.config.model_name)
+                model = constructor()
+            except Exception as import_error:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "Failed to instantiate DINOv3 backbone. Ensure the official repo is available "
+                    "via `repo_path` or installed as a package."
+                ) from import_error
+
+        if model is None:  # pragma: no cover - defensive
+            raise RuntimeError("DINOv3 model initialization returned None")
+
         if self.config.checkpoint_path:
             state = torch.load(self.config.checkpoint_path, map_location="cpu")
             missing, unexpected = model.load_state_dict(state, strict=False)
@@ -167,10 +148,6 @@ class DINOv3FeatureExtractor:
 
         return model
     
-    @staticmethod
-    def _is_local_repo(repo_or_dir: str) -> bool:
-        return Path(repo_or_dir).exists()
-
     def _prepare(self, image: np.ndarray) -> torch.Tensor:
         tensor = self.transform(image).unsqueeze(0)
         return tensor.to(self.device, dtype=self.dtype)
@@ -178,14 +155,14 @@ class DINOv3FeatureExtractor:
     def _gather_layers(self, inputs: torch.Tensor) -> Sequence[torch.Tensor | Tuple]:
         if not hasattr(self.model, "get_intermediate_layers"):
             raise RuntimeError("DINOv3 model must expose get_intermediate_layers")
-        max_offset = max(self.config.output_layers)
+        max_offset = max(self.output_layers)
         raw_layers = self.model.get_intermediate_layers(
             inputs,
             n=max_offset + 1,
             reshape=False,
             return_class_token=True,
         )
-        selected = [raw_layers[-(offset + 1)] for offset in self.config.output_layers]
+        selected = [raw_layers[-(offset + 1)] for offset in self.output_layers]
         return selected
 
     @staticmethod
@@ -214,7 +191,7 @@ class DINOv3FeatureExtractor:
                         cls_candidate = item
                 elif isinstance(item, (tuple, list)):
                     try:
-                        nested_patch, nested_cls = DINOv3FeatureExtractor._split_tokens(item)
+                        nested_patch, nested_cls = Dinov3Backbone._split_tokens(item)
                     except TypeError:
                         continue
                     else:
@@ -276,12 +253,12 @@ class DINOv3FeatureExtractor:
         
         if self.config.fusion_method == "weighted_concat":
             # 加权后拼接
-            weighted = [feat * w for feat, w in zip(normalized, self.config.layer_weights)]
+            weighted = [feat * w for feat, w in zip(normalized, self.layer_weights)]
             fused = torch.cat(weighted, dim=-1)
-            
+
         elif self.config.fusion_method == "weighted_sum":
             # 加权求和（要求所有层维度相同）
-            weighted = [feat * w for feat, w in zip(normalized, self.config.layer_weights)]
+            weighted = [feat * w for feat, w in zip(normalized, self.layer_weights)]
             fused = torch.stack(weighted, dim=0).sum(dim=0)
             
         elif self.config.fusion_method == "concat":
@@ -554,7 +531,11 @@ class DINOv3FeatureExtractor:
             "processed_image_shape": (processed_height, processed_width),
         }
 
-    def to(self, device: torch.device | str) -> "DINOv3FeatureExtractor":
+    def to(self, device: torch.device | str) -> "Dinov3Backbone":
         self.device = torch.device(device)
         self.model = self.model.to(self.device)
         return self
+
+
+# Backwards compatibility shim for older imports
+DINOv3FeatureExtractor = Dinov3Backbone

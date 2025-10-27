@@ -1,17 +1,20 @@
 # mono3d
 
-Zero-shot instance segmentation toolkit that wires together [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3)
-for proposal generation and [facebookresearch/sam2](https://github.com/facebookresearch/sam2) for promptable segmentation.
-The resulting masks are saved in a format that can be consumed by downstream 3D reconstruction pipelines such as
-3D Gaussian Splatting.
+Zero-shot instance segmentation toolkit that wires together
+[facebookresearch/dinov3](https://github.com/facebookresearch/dinov3) for semantic understanding and
+[facebookresearch/sam2](https://github.com/facebookresearch/sam2) for promptable segmentation. The refactored pipeline
+follows the technical plan outlined in the user brief: DINOv3 features drive objectness, detection and segmentation
+adapters, which are fused into prompts for SAM2 to refine into class-aware foreground masks.
 
 ## Features
 
-- TorchHub-compatible DINOv3 loader with automatic attention heatmap extraction.
-- Prompt generation utilities (bounding boxes + positive/negative points) derived from DINOv3 attention.
-- SAM2 wrapper built on top of the official Hugging Face integration for batched prompt decoding.
-- Modular post-processing and reconstruction export utilities for easy integration with 3DGS workflows.
-- CLI pipeline supporting single images, directories, and videos.
+- Official DINOv3 integration with multi-layer fusion, PCA, and objectness scoring.
+- Lightweight detection/segmentation adapters that can load official checkpoints or operate in random-init mode for
+  experimentation.
+- Fusion utilities that intersect detection boxes, segmentation probabilities, and objectness to isolate foreground
+  regions before SAM2 refinement.
+- Simple prompt builder (points/boxes/mask seeds) and SAM2 wrapper that works with the official Meta release.
+- Streamlined CLI pipeline supporting single images or directories with optional intermediate diagnostics.
 
 ## Getting Started
 
@@ -42,7 +45,7 @@ Update `configs/model_config.yaml` if your environment uses different paths. The
 - `/media/pc/D/zhaochen/MonoSGS-Prior/checkpoints/pretrained/sam2.1_hiera_large.pt`
 - `/media/pc/D/zhaochen/MonoSGS-Prior/checkpoints/pretrained/sam2.1_hiera_large.yaml`
 
-Set the Virtual KITTI 2 dataset root to `/media/pc/D/datasets/vkitti2` for the helper scripts below.
+Set the Virtual KITTI 2 dataset root to `/media/pc/D/datasets/vkitti2` if you want to reproduce the examples below.
 
 ## Running Inference
 
@@ -50,58 +53,31 @@ Set the Virtual KITTI 2 dataset root to `/media/pc/D/datasets/vkitti2` for the h
 python -m src image \
   --input path/to/image.png \
   --output outputs/run_001 \
-  --config configs/model_config.yaml \
-  --prompt-config configs/prompt_config.yaml
+  --config configs/model_config.yaml
 ```
 
-For directory processing replace `image` with `directory` and provide a directory path, or use `video` for video files.
+For directory processing replace `image` with `directory` and provide a directory path.
 
-### Zero-shot class-aware pipeline
+### Zero-shot foreground instance pipeline
 
-The default configuration wires together the official DINOv3 backbone, detection adapter, segmentation adapter,
-and SAM2 checkpoint without any additional training. When the detection/segmentation adapters are configured, the CLI
-automatically switches to the class-aware fusion pipeline:
+The refactored codebase implements the design brief directly:
 
-1. **DINOv3 backbone** produces patch tokens, attention maps, and an objectness heatmap.
-2. **Detection adapter** (e.g., `coco_detr_head`) yields class-aware bounding boxes and category scores.
-3. **Segmentation adapter** (e.g., `ade20k_m2f_head`) returns per-class probability maps.
-4. The pipeline intersects the objectness map, detection boxes, and segmentation probabilities to obtain clean,
-   class-labelled prompts (points/boxes/optional mask seeds) that cover foreground instances only.
-5. **SAM2** refines each prompt into a high-quality instance mask; the detection adapter class names are attached to
-   the final predictions.
+1. **DINOv3 backbone** (official repo) emits multi-layer patch tokens, attention, and an objectness map.
+2. **Detection adapter** provides coarse bounding boxes and class probabilities.
+3. **Segmentation adapter** outputs per-class probability maps over the processed resolution.
+4. The fusion module combines detection, segmentation, and objectness to isolate class-aware foreground regions and
+   splits them with connected components.
+5. The prompt builder creates points/boxes/mask seeds which SAM2 refines into sharp instance masks.
 
-All steps operate in zero-shot mode—only the published checkpoints are required. To export detailed intermediate
-visualizations (feature grids, adapter outputs, prompts, and masks) during inference:
+All steps operate in zero-shot mode—only the published checkpoints are required. To export intermediate fusion
+artifacts during inference:
 
 ```bash
 python -m src image \
   --input /media/pc/D/datasets/vkitti2/Scene01/clone/frames/rgb/Camera_0/rgb_00061.jpg \
-  --output outputs/hdbscan \
+  --output outputs/adapter \
   --config configs/model_config.yaml \
   --visualize-intermediate
-```
-
-To run on the VKITTI2 dataset end-to-end:
-
-```bash
-./scripts/run_vkitti.sh \
-  /media/pc/D/datasets/vkitti2 \
-  outputs/vkitti_scene_masks \
-  configs/model_config.yaml \
-  configs/prompt_config.yaml \
-  Camera_0
-```
-
-Advanced usage allows filtering scenes/clones and limiting frame counts:
-
-```bash
-python -m src vkitti \
-  --input /media/pc/D/datasets/vkitti2 \
-  --output outputs/vkitti_subset \
-  --config configs/model_config.yaml \
-  --vkitti-scenes Scene01 Scene02 \
-  --vkitti-clones clone_0001 clone_0002 \
-  --vkitti-limit 200
 ```
 
 ## Project Layout
@@ -116,8 +92,6 @@ outputs/                  # Default output root for masks & recon inputs
 
 ## Notes
 
-- Set `pipeline.input_size` to resize inputs before inference when speed is critical.
-- Adjust `pipeline.max_prompts_per_batch` to balance speed vs. memory usage during SAM2 decoding.
-- Modify `reconstruction.mask_extension` to control whether masks are stored as PNG or NPY arrays.
+- Modify `configs/model_config.yaml` to adjust fusion thresholds, prompt options, and post-processing.
 - Ensure the SAM2 configuration YAML matches the checkpoint; the default expects
   `/media/pc/D/zhaochen/MonoSGS-Prior/checkpoints/pretrained/sam2.1_hiera_large.yaml`.

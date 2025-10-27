@@ -2,263 +2,65 @@
 # Mono3D Zero-Shot Segmentation Config
 # ===================================
 
-# 设备配置
-device: "cuda"
-dtype: "float32"
-
-# ===================================
-# DINOv3 特征提取器配置
-# ===================================
 dinov3:
-  # 模型路径
-  repo_or_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
+  repo_path: "/media/pc/D/zhaochen/mono3d/dinov3"
   model_name: "dinov3_vitl16"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_lvd1689m.pth"
-  
-  # 基础参数
-  use_torch_hub: true
-  torchhub_source: "local"
   image_size: 448
-  patch_size: 16
-  
-  # 多层特征融合
-  output_layers: [4, 8, 12]           # 使用的层
-  layer_weights: [0.2, 0.3, 0.5]      # 层权重（自动归一化）
-  fusion_method: "weighted_sum"        # weighted_sum | weighted_concat | concat
-  
-  # PCA降维（可选）
-  enable_pca: false
+  output_layers: [4, 8, 12]
+  layer_weights: [0.2, 0.3, 0.5]
+  fusion_method: "weighted_sum"
+  enable_pca: true
   pca_dim: 32
-  
-  # 对象性计算
   enable_objectness: true
-  objectness_smoothing_kernel: 3       # 平滑核大小（奇数，1=禁用）
-  objectness_contrast_gamma: 0.7       # 对比度调整（<1提升对比）
-  
-  # 位置编码
+  objectness_smoothing_kernel: 3
+  objectness_contrast_gamma: 0.7
   append_positional_features: true
   positional_feature_scale: 0.25
+  dtype: "float32"
+  device: "cuda"
 
-# ===================================
-# SAM2 分割器配置
-# ===================================
 sam2:
-  backend: "official"                  # official | huggingface
+  backend: "official"
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
   model_config: "sam2.1/sam2.1_hiera_l"
   max_batch_size: 16
-  mask_selection_strategy: "best_balanced"  # best_score | best_balanced | largest
+  mask_selection_strategy: "best_balanced"
   multimask_output: false
 
-# ===================================
-# 分割管道配置
-# ===================================
-pipeline:
-  # 聚类配置
-  cluster:
-    # 聚类方法
-    clustering_method: "adaptive"      # fixed | adaptive | hdbscan | meanshift
-    num_clusters: 6                    # fixed方法使用
-    min_clusters: 4                    # adaptive方法使用
-    max_clusters: 30
-    cluster_selection_method: "silhouette"  # elbow | silhouette | gap
-    
-    # 通用参数
-    max_iterations: 40
-    random_state: 0
-    min_region_area: 100
-    max_regions: 30
-    min_instance_area: 80
-    
-    # 实例分离
-    enable_instance_split: true
-    max_instances_per_cluster: 12
-    
-    # 对象性筛选
-    use_objectness_filter: true
-    objectness_threshold: 0.35
-    objectness_weight: 0.5
-    apply_objectness_mask: true
-    objectness_mask_threshold: 0.35
-    objectness_min_keep_patches: 150
-    objectness_percentile: 0.6
-    objectness_min_std: 0.01
-    objectness_dynamic_floor: 0.3
-    
-    # 连通域分析
-    use_connected_components: true
-    min_component_area: 120
-    
-    # 前景/背景
-    foreground_only: true
-    max_background_ratio: 0.8
-    
-    # 聚类合并
-    merge_small_clusters: true
-    min_cluster_size: 30
-    merge_similar_clusters: true
-    similarity_threshold: 0.9
-    min_similarity_cluster_size: 200
-    merge_edge_background: true
-    edge_background_area_ratio: 0.18
-    edge_touch_ratio: 0.32
-  
-  # Prompt生成配置
-  prompt:
-    include_boxes: false
-    include_points: true
-    include_masks: true
-    include_heatmaps: false
-    heatmap_weight: 0.4
-    
-    # 点采样策略
-    point_strategy: "density"          # centroid | density | grid
-    max_points_per_region: 3
-    min_positive_points: 3
-    fallback_point_strategy: "centroid"
-    density_noise_handling: "nearest"
-    grid_points_per_side: 3
-    
-    # Mask prompt配置
-    mask_gaussian_sigma: 1.5
-    
-    # 密度聚类（用于点采样）
-    density_cluster:
-      method: "hdbscan"                # hdbscan | meanshift | dbscan
-      min_cluster_size: 20
-      min_samples: 8
-      cluster_selection_epsilon: 0.0
-      metric: "euclidean"
-      allow_single_cluster: false
-    
-    log_top_k: 5
-  
-  # Proposal精化
-  proposal_refine:
-    enable: true
-    closing_kernel: 5
-    opening_kernel: 3
-    blur_sigma: 1.5
-    blur_threshold: 0.45
-    min_keep_area: 120
-  
-  # 后处理
-  area_threshold: 80
-  kernel_size: 5
-  dilation_radius: 0
-  
-  # NMS去重
-  enable_nms: true
-  iou_threshold: 0.6
-  objectness_weight: 0.6
-  confidence_weight: 0.3
-  area_weight: 0.1
-  min_mask_objectness: 0.35
-  min_mask_area: 120
-  
-  # 超像素（可选）
-  use_superpixels: false
-  superpixel:
-    method: "slic"                     # slic | felzenszwalb | seeds
-    n_segments: 1500
-    compactness: 12.0
-    sigma: 1.0
-  
-  auto_superpixel:
-    enable: true
-    min_proposals: 6
-    min_clusters: 6
-    max_mean_area_ratio: 0.3
-    max_single_area_ratio: 0.6
-    log_top_k: 5
-  
-  # 图聚类（可选）
-  use_graph_clustering: false
-  graph_cluster:
-    method: "spectral"                 # spectral | louvain | label_propagation
-    n_clusters: 6
-    affinity: "rbf"
-    gamma: 1.0
-  
-  # 密度聚类（可选）
-  use_density_clustering: true
-  density_cluster:
-    method: "meanshift"                # hdbscan | meanshift | dbscan
-    min_cluster_size: 30
-    min_samples: 10
-  
-  # CRF细化（可选）
-  crf:
-    enable: false
-    max_iterations: 5
-    pos_w: 3.0
-    pos_xy_std: 3.0
-    bi_w: 4.0
-    bi_xy_std: 80.0
-    bi_rgb_std: 5.0
-  
-  # 输出配置
-  output_mask_format: "png"
-  save_visualization: true
-  visualization_alpha: 0.5
+detection_adapter:
+  checkpoint_path: ""
+  feature_dim: 1024
+  num_classes: 91
+  score_threshold: 0.25
 
-# ===================================
-# 类别感知模式（可选）
-# ===================================
-class_aware:
-  # 启用开关（null=自动检测）
-  enable: null
-  
-  # 检测Adapter
-  detection_adapter:
-    target: "src.adapters.detection:build_coco_adapter"
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_coco.pth"
-    python_paths: []
-    kwargs:
-      feature_dim: 1024
-      num_classes: 91
-  
-  # 分割Adapter
-  segmentation_adapter:
-    target: "src.adapters.segmentation:build_ade20k_adapter"
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vitl16_ade20k.pth"
-    python_paths: []
-    kwargs:
-      feature_dim: 1024
-      num_classes: 150
-  
-  # Prompt融合
-  prompt_fusion:
-    objectness_threshold: 0.45
-    segmentation_threshold: 0.4
-    class_probability_threshold: 0.35
-    detection_score_threshold: 0.25
-    min_component_area: 60
-    min_prompt_area: 60
-    max_prompts_per_class: 10
-    nms_iou_threshold: 0.6
-    score_weights:
-      det: 0.4
-      seg: 0.4
-      obj: 0.2
-    include_mask_prompts: true
-  
-  # Prompt后处理
-  prompt_postprocess:
-    enable: true
-    closing_kernel: 5
-    opening_kernel: 3
-    min_instance_area: 60
-  
-  # 类别设置
-  foreground_class_ids: null           # null=自动检测所有前景
-  background_class_ids: [0]
+segmentation_adapter:
+  checkpoint_path: ""
+  feature_dim: 1024
+  num_classes: 150
 
-# ===================================
-# 重建输出（可选）
-# ===================================
-reconstruction:
-  output_directory: "outputs/recon_inputs"
-  save_metadata: true
-  metadata_keys: []
-  mask_extension: ".npy"
+fusion:
+  objectness_threshold: 0.45
+  segmentation_threshold: 0.35
+  detection_score_threshold: 0.25
+  min_instance_area: 60
+  dilation_kernel: 3
+  nms_iou_threshold: 0.6
+
+prompts:
+  include_points: true
+  include_boxes: true
+  include_masks: true
+  max_points_per_region: 3
+  grid_points_per_side: 0
+
+instance_grouping:
+  method: "connected_components"
+  min_area: 60
+
+postprocess:
+  enable: true
+  closing_kernel: 5
+  opening_kernel: 3
+  min_instance_area: 60
+

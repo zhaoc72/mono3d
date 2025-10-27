@@ -1,39 +1,49 @@
-"""Segmentation adapter using DINOv3 features."""
+"""Segmentation adapter operating on DINOv3 patch maps."""
 from __future__ import annotations
 
-from typing import Optional, Tuple, Sequence
 import os
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..class_aware_pipeline import SegmentationOutput
+from ..pipeline_types import SegmentationOutput
 from ..utils import LOGGER
 
 
-def build_ade20k_adapter(
-    checkpoint_path: str,
+@dataclass
+class SegmentationAdapterConfig:
+    """Runtime configuration for the simplified segmentation head."""
+
+    checkpoint_path: str = ""
+    feature_dim: int = 1024
+    num_classes: int = 150
+    class_names: Optional[Sequence[str]] = None
+
+
+def build_segmentation_adapter(
+    config: SegmentationAdapterConfig,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.float32,
-    **kwargs
 ) -> "SegmentationAdapter":
-    """
-    Build ADE20K segmentation adapter.
-    
-    This is a simplified adapter that processes DINOv3 features directly.
-    For production use, replace with official DINOv3 segmentation adapter.
-    """
-    LOGGER.info(f"Building segmentation adapter (checkpoint: {checkpoint_path})")
-    
+    """Instantiate the lightweight segmentation adapter."""
+
+    checkpoint_path = config.checkpoint_path
+    LOGGER.info(
+        "Building segmentation adapter (checkpoint: %s)", checkpoint_path or "<random>"
+    )
+
     adapter = SegmentationAdapter(
-        feature_dim=kwargs.get("feature_dim", 1024),
-        num_classes=150,  # ADE20K has 150 classes
+        feature_dim=config.feature_dim,
+        num_classes=config.num_classes,
+        class_names=config.class_names,
         device=device,
         dtype=torch_dtype,
     )
-    
+
     # Load checkpoint if exists
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
@@ -63,11 +73,27 @@ def build_ade20k_adapter(
             LOGGER.info("Using randomly initialized weights")
     else:
         LOGGER.info("No checkpoint provided, using randomly initialized weights")
-    
+
     adapter.model = adapter.model.to(device=device, dtype=torch_dtype)
     adapter.model.eval()
-    
+
     return adapter
+
+
+def build_ade20k_adapter(
+    checkpoint_path: str,
+    device: str = "cuda",
+    torch_dtype: torch.dtype = torch.float32,
+    **kwargs,
+) -> "SegmentationAdapter":
+    """Backward-compatible helper mirroring the old API."""
+
+    config = SegmentationAdapterConfig(
+        checkpoint_path=checkpoint_path,
+        feature_dim=kwargs.get("feature_dim", 1024),
+        num_classes=kwargs.get("num_classes", 150),
+    )
+    return build_segmentation_adapter(config, device=device, torch_dtype=torch_dtype)
 
 
 class SimpleSegmentationHead(nn.Module):
@@ -133,11 +159,14 @@ class SegmentationAdapter:
         num_classes: int = 150,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
+        class_names: Optional[Sequence[str]] = None,
     ):
         self.model = SimpleSegmentationHead(feature_dim, num_classes)
         self.device = torch.device(device)
         self.dtype = dtype
-        self.class_names = self.ADE20K_CLASSES[:num_classes]
+        if class_names is None:
+            class_names = self.ADE20K_CLASSES[:num_classes]
+        self.class_names = list(class_names)
         self.num_classes = num_classes
         
     @torch.inference_mode()

@@ -1,27 +1,35 @@
-"""Zero-shot instance segmentation pipelines and utilities."""
-
-from .class_aware_pipeline import (
-    ClassAwareInstance,
-    ClassAwarePipelineResult,
-    ClassAwarePrompt,
-    ClassAwarePromptPipeline,
-    DetectionAdapter,
+"""Public API for the simplified mono3d zero-shot pipeline."""
+from .config import (
+    Dinov3BackboneConfig,
+    ForegroundFusionConfig,
+    InstanceGroupingConfig,
+    PipelineConfig,
+    PostProcessConfig,
+    PromptStrategyConfig,
+)
+from .pipeline import ForegroundSegmentationPipeline
+from .pipeline_types import (
+    CandidateRegion,
     DetectionOutput,
-    PromptFusionConfig,
-    PromptPostProcessConfig,
-    SegmentationAdapter,
+    InstancePrediction,
+    PipelineResult,
+    PromptDescription,
     SegmentationOutput,
 )
 
 __all__ = [
-    "ClassAwareInstance",
-    "ClassAwarePipelineResult",
-    "ClassAwarePrompt",
-    "ClassAwarePromptPipeline",
-    "DetectionAdapter",
+    "Dinov3BackboneConfig",
+    "ForegroundFusionConfig",
+    "InstanceGroupingConfig",
+    "PipelineConfig",
+    "PostProcessConfig",
+    "PromptStrategyConfig",
+    "ForegroundSegmentationPipeline",
+    "CandidateRegion",
     "DetectionOutput",
-    "PromptFusionConfig",
-    "PromptPostProcessConfig",
-    "SegmentationAdapter",
+    "InstancePrediction",
+    "PipelineResult",
+    "PromptDescription",
     "SegmentationOutput",
 ]
+

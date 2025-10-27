@@ -1,39 +1,49 @@
-"""Detection adapter using DINOv3 features."""
+"""Detection adapter working with DINOv3 patch tokens."""
 from __future__ import annotations
 
-from typing import Optional, Tuple
 import os
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..class_aware_pipeline import DetectionOutput
+from ..pipeline_types import DetectionOutput
 from ..utils import LOGGER
 
 
-def build_coco_adapter(
-    checkpoint_path: str,
+@dataclass
+class DetectionAdapterConfig:
+    """Runtime settings for the lightweight DETR-style adapter."""
+
+    checkpoint_path: str = ""
+    feature_dim: int = 1024
+    num_classes: int = 91
+    class_names: Optional[Sequence[str]] = None
+    score_threshold: float = 0.25
+
+
+def build_detection_adapter(
+    config: DetectionAdapterConfig,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.float32,
-    **kwargs
 ) -> "DetectionAdapter":
-    """
-    Build COCO detection adapter.
-    
-    This is a simplified adapter that processes DINOv3 features directly.
-    For production use, replace with official DINOv3 DETR adapter.
-    """
-    LOGGER.info(f"Building detection adapter (checkpoint: {checkpoint_path})")
-    
+    """Instantiate the lightweight detection adapter."""
+
+    checkpoint_path = config.checkpoint_path
+    LOGGER.info("Building detection adapter (checkpoint: %s)", checkpoint_path or "<random>")
+
     adapter = DetectionAdapter(
-        feature_dim=kwargs.get("feature_dim", 1024),
-        num_classes=91,  # COCO has 80 classes + background
+        feature_dim=config.feature_dim,
+        num_classes=config.num_classes,
+        class_names=config.class_names,
+        score_threshold=config.score_threshold,
         device=device,
         dtype=torch_dtype,
     )
-    
+
     # Load checkpoint if exists
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
@@ -64,11 +74,28 @@ def build_coco_adapter(
             LOGGER.info("Using randomly initialized weights")
     else:
         LOGGER.info("No checkpoint provided, using randomly initialized weights")
-    
+
     adapter.model = adapter.model.to(device=device, dtype=torch_dtype)
     adapter.model.eval()
-    
+
     return adapter
+
+
+def build_coco_adapter(
+    checkpoint_path: str,
+    device: str = "cuda",
+    torch_dtype: torch.dtype = torch.float32,
+    **kwargs,
+) -> "DetectionAdapter":
+    """Backward-compatible helper mirroring the old API."""
+
+    config = DetectionAdapterConfig(
+        checkpoint_path=checkpoint_path,
+        feature_dim=kwargs.get("feature_dim", 1024),
+        num_classes=kwargs.get("num_classes", 91),
+        score_threshold=kwargs.get("score_threshold", 0.25),
+    )
+    return build_detection_adapter(config, device=device, torch_dtype=torch_dtype)
 
 
 class SimpleDETR(nn.Module):
@@ -210,11 +237,16 @@ class DetectionAdapter:
         num_classes: int = 91,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
+        class_names: Optional[Sequence[str]] = None,
+        score_threshold: float = 0.25,
     ):
         self.model = SimpleDETR(feature_dim, num_classes)
         self.device = torch.device(device)
         self.dtype = dtype
-        self.class_names = self.COCO_CLASSES[:num_classes]
+        if class_names is None:
+            class_names = self.COCO_CLASSES[:num_classes]
+        self.class_names = list(class_names)
+        self.score_threshold = float(score_threshold)
         
     @torch.inference_mode()
     def predict(
@@ -260,15 +292,16 @@ class DetectionAdapter:
         labels_np = labels.cpu().numpy().astype(np.int32)
         
         # Filter by score threshold
-        score_threshold = 0.25
-        valid_mask = scores_np >= score_threshold
-        
+        valid_mask = scores_np >= self.score_threshold
+
         boxes_np = boxes_np[valid_mask]
         scores_np = scores_np[valid_mask]
         labels_np = labels_np[valid_mask]
-        
+
         LOGGER.debug(
-            f"Detection: {len(boxes_np)} boxes (score >= {score_threshold:.2f})"
+            "Detection: %d boxes (score >= %.2f)",
+            len(boxes_np),
+            self.score_threshold,
         )
         
         return DetectionOutput(
