@@ -308,6 +308,114 @@ class SAM2Segmenter:
                 raise ValueError(f"Unexpected mask tensor shape: {mask_np.shape}")
         return masks
 
+    def _infer_dense_prompt_shape(self) -> Optional[Tuple[int, int]]:
+        if self.predictor is None:
+            return None
+
+        candidates = []
+        for attr_name in ("_features", "features", "_last_features"):
+            feats = getattr(self.predictor, attr_name, None)
+            if isinstance(feats, dict):
+                candidates.append(feats.get("image_embeddings"))
+                candidates.append(feats.get("image_embedding"))
+
+        for attr_name in ("_image_embeddings", "image_embeddings", "_image_embedding", "image_embedding"):
+            candidates.append(getattr(self.predictor, attr_name, None))
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if isinstance(candidate, torch.Tensor):
+                shape = candidate.shape
+            elif hasattr(candidate, "shape"):
+                shape = candidate.shape  # type: ignore[assignment]
+            else:
+                continue
+            if len(shape) >= 2:
+                return int(shape[-2]), int(shape[-1])
+        return None
+
+    @staticmethod
+    def _resize_mask(mask: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+        tensor = torch.from_numpy(mask.astype(np.float32))
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0).unsqueeze(0)
+        elif tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim == 4:
+            pass
+        else:
+            raise ValueError(f"Unsupported mask dimensions: {tensor.shape}")
+
+        resized = torch.nn.functional.interpolate(
+            tensor,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        if resized.ndim == 4:
+            return resized.squeeze(0).squeeze(0).cpu().numpy()
+        if resized.ndim == 3:
+            return resized.squeeze(0).cpu().numpy()
+        return resized.cpu().numpy()
+
+    def _prepare_mask_input(
+        self,
+        mask_input: Optional[np.ndarray],
+        target_shape: Optional[Tuple[int, int]],
+    ) -> Optional[np.ndarray]:
+        if mask_input is None:
+            return None
+
+        mask_arr = np.asarray(mask_input, dtype=np.float32)
+        if mask_arr.size == 0:
+            return None
+
+        if target_shape is None:
+            LOGGER.debug("Dropping mask_input because dense prompt shape could not be inferred")
+            return None
+
+        # Reduce potential channel dimension.
+        if mask_arr.ndim > 3:
+            mask_arr = np.squeeze(mask_arr)
+        if mask_arr.ndim == 3 and mask_arr.shape[0] == 1:
+            mask_arr = mask_arr[0]
+
+        if mask_arr.ndim not in {2, 3}:
+            LOGGER.warning("Dropping mask_input with unsupported shape %s", mask_arr.shape)
+            return None
+
+        if mask_arr.ndim == 3 and mask_arr.shape[0] not in {1, 3}:
+            LOGGER.warning("Dropping mask_input with ambiguous channel dimension %s", mask_arr.shape)
+            return None
+
+        if mask_arr.ndim == 3:
+            # If channels are present, average to a single channel.
+            mask_arr = mask_arr.mean(axis=0)
+
+        if target_shape is not None and mask_arr.shape != target_shape:
+            try:
+                mask_arr = self._resize_mask(mask_arr, target_shape)
+            except Exception as exc:  # pragma: no cover - safe fallback
+                LOGGER.warning(
+                    "Failed to resize mask_input from %s to %s (%s); dropping mask prompt",
+                    mask_arr.shape,
+                    target_shape,
+                    exc,
+                )
+                return None
+
+        if target_shape is not None and mask_arr.shape != target_shape:
+            LOGGER.warning(
+                "Dropping mask_input due to shape mismatch (expected %s, got %s)",
+                target_shape,
+                mask_arr.shape,
+            )
+            return None
+
+        return mask_arr[None, ...]
+
     def _prepare_official_prompt(
         self,
         image: np.ndarray,
@@ -315,6 +423,7 @@ class SAM2Segmenter:
         points: Optional[Sequence[Tuple[int, int]]],
         labels: Optional[Sequence[int]],
         mask_input: Optional[np.ndarray],
+        mask_target_shape: Optional[Tuple[int, int]],
     ) -> Dict[str, np.ndarray]:
         if points is not None and labels is None:
             raise ValueError("Point prompts require labels")
@@ -325,10 +434,9 @@ class SAM2Segmenter:
             prompt["point_coords"] = np.asarray(points, dtype=np.float32)
             prompt["point_labels"] = np.asarray(labels, dtype=np.int64)
         if mask_input is not None:
-            mask_arr = np.asarray(mask_input, dtype=np.float32)
-            if mask_arr.ndim == 2:
-                mask_arr = mask_arr[None, ...]
-            prompt["mask_input"] = mask_arr
+            prepared = self._prepare_mask_input(mask_input, mask_target_shape)
+            if prepared is not None:
+                prompt["mask_input"] = prepared
         prompt["image"] = image
         return prompt
 
@@ -351,6 +459,8 @@ class SAM2Segmenter:
         
         self.predictor.set_image(bgr_image)
 
+        mask_prompt_shape = self._infer_dense_prompt_shape()
+
         num_prompts = 0
         if boxes is not None:
             num_prompts = len(boxes)
@@ -367,7 +477,14 @@ class SAM2Segmenter:
             mask_input = None
             if mask_inputs is not None and idx < len(mask_inputs):
                 mask_input = mask_inputs[idx]
-            prompt = self._prepare_official_prompt(bgr_image, box, pts, lbl, mask_input)
+            prompt = self._prepare_official_prompt(
+                bgr_image,
+                box,
+                pts,
+                lbl,
+                mask_input,
+                mask_prompt_shape,
+            )
             predict_kwargs = {
                 k: v
                 for k, v in prompt.items()
