@@ -93,17 +93,21 @@ class Dinov3Backbone:
         return expanded if os.path.isdir(expanded) else None
 
     def _load_model(self) -> torch.nn.Module:
+        """
+        替换 Dinov3Backbone._load_model 方法的内容
+        """
         repo = self.repo_path or "facebookresearch/dinov3"
         source = "local" if self.repo_path else "github"
         LOGGER.info("Loading DINOv3 weights %s from %s", self.config.model_name, repo)
 
-        # ====== 使用 CPU Offload + 单 GPU ======
+        # ====== 使用 Accelerate + 多卡并行 + CPU Offload ======
         try:
             from accelerate import init_empty_weights, load_checkpoint_and_dispatch, infer_auto_device_map
         except ImportError:
             raise ImportError("Please install accelerate: pip install accelerate")
 
         # 1. 创建空模型
+        LOGGER.info("Step 1/4: Creating empty model...")
         with init_empty_weights():
             try:
                 model = torch.hub.load(
@@ -123,19 +127,71 @@ class Dinov3Backbone:
         if model is None:
             raise RuntimeError("DINOv3 model initialization returned None")
 
-        # 2. 自动推断设备映射（GPU + CPU offload）
+        # 2. 配置多卡显存分配策略
+        # ViT-7B/16: ~7B 参数，float16 下约 14GB 模型权重
+        # 每卡预留空间：权重 + 激活 + 梯度（推理不需要梯度）
+        num_gpus = torch.cuda.device_count()
+        LOGGER.info(f"Step 2/4: Detected {num_gpus} GPUs")
+        
+        if num_gpus >= 4:
+            # 4卡最优配置：
+            # - 总权重 ~14GB，分散到4卡 = 每卡 ~3.5GB 权重
+            # - 预留 18GB/卡 用于权重分配（有足够余量）
+            # - 实际使用约 5-7GB/卡（权重 + 激活）
+            max_memory = {
+                0: "18GiB",  # GPU 0: 18GB 权重空间
+                1: "18GiB",  # GPU 1: 18GB 权重空间
+                2: "18GiB",  # GPU 2: 18GB 权重空间
+                3: "18GiB",  # GPU 3: 18GB 权重空间
+                "cpu": "100GiB",  # CPU 兜底（极少使用）
+            }
+            LOGGER.info("✅ Using 4-GPU configuration:")
+            LOGGER.info("   - Each GPU: 18GB for model weights")
+            LOGGER.info("   - Expected usage: 5-7GB/GPU")
+            LOGGER.info("   - CPU offload: 100GB (fallback)")
+            
+        elif num_gpus >= 2:
+            # 2卡配置：每卡承担更多权重
+            max_memory = {
+                0: "20GiB",
+                1: "20GiB",
+                "cpu": "100GiB",
+            }
+            LOGGER.info("✅ Using 2-GPU configuration")
+            
+        else:
+            # 单卡配置（需要大量CPU offload）
+            max_memory = {
+                0: "20GiB",
+                "cpu": "100GiB",
+            }
+            LOGGER.warning("⚠️  Single GPU mode - will use heavy CPU offload")
+        
+        # 3. 自动推断设备映射
+        LOGGER.info("Step 3/4: Inferring optimal device map...")
         device_map = infer_auto_device_map(
             model,
-            max_memory={0: "20GiB", "cpu": "100GiB"},  # GPU 0 预留 4GB，剩余用 CPU
-            no_split_module_classes=["Block"],         # 不切分 Transformer Block
-            dtype=torch.float16,
+            max_memory=max_memory,
+            no_split_module_classes=["Block"],  # 🔥 关键：不切分Transformer Block
+            dtype=torch.float16,  # 使用 FP16 减少显存占用
         )
         
-        LOGGER.info("Device map: %s", device_map)
+        # 打印设备分配统计
+        device_stats = {}
+        for key, device in device_map.items():
+            device_stats[device] = device_stats.get(device, 0) + 1
+        
+        LOGGER.info("📊 Device allocation summary:")
+        for device in sorted(device_stats.keys()):
+            count = device_stats[device]
+            LOGGER.info(f"   - {device}: {count} modules")
 
-        # 3. 加载权重并分配
+        # 4. 加载权重并分配到设备
         if not self.config.checkpoint_path:
             raise ValueError("checkpoint_path is required")
+        
+        LOGGER.info("Step 4/4: Loading checkpoint and dispatching to devices...")
+        LOGGER.info(f"   Checkpoint: {self.config.checkpoint_path}")
         
         model = load_checkpoint_and_dispatch(
             model,
@@ -147,9 +203,20 @@ class Dinov3Backbone:
             offload_state_dict=True,
         )
         
-        # 4. 设置主设备
+        # 5. 设置主设备为 cuda:0（前向传播的输入会在这里）
         self.device = torch.device("cuda:0")
-        LOGGER.info("Model loaded with CPU offload")
+        
+        # 6. 打印最终显存使用情况
+        if torch.cuda.is_available():
+            LOGGER.info("🎯 GPU Memory Status:")
+            for i in range(min(num_gpus, 4)):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                LOGGER.info(f"   GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        
+        LOGGER.info("=" * 70)
+        LOGGER.info("✅ Model loaded successfully with multi-GPU + CPU offload")
+        LOGGER.info("=" * 70)
         
         return model
 
