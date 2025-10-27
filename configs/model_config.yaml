@@ -17,10 +17,10 @@ model:
     
     # Model architecture
     patch_size: 16
-    embed_dim: 1024
-    num_heads: 16
-    num_layers: 24
-    image_size: [224, 224]
+    embed_dim: 4096
+    num_heads: 32
+    num_layers: 40
+    image_size: 518
     
     # Training settings
     freeze: true
@@ -32,8 +32,8 @@ model:
     load_in_8bit: false                 # Use 8-bit quantization (experimental)
     
     # Feature extraction settings
-    output_layers: [11, 17, 23]
-    layer_weights: [1.0, 1.0, 1.0]
+    output_layers: [9, 19, 29, 39]
+    layer_weights: [1.0, 1.0, 1.0, 1.0]
     fusion_method: "weighted_sum"
     
     # PCA and objectness

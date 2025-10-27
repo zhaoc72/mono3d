@@ -37,9 +37,15 @@ class Dinov3Backbone:
         self.pca = None
         self.pca_fitted = False
         
+        # 处理 image_size 可能是列表或整数的情况
+        if isinstance(config.image_size, (list, tuple)):
+            image_size = tuple(config.image_size)  # [518, 518] → (518, 518)
+        else:
+            image_size = (config.image_size, config.image_size)  # 518 → (518, 518)
+
         transform_steps = [
             transforms.ToPILImage(),
-            transforms.Resize((config.image_size, config.image_size)),
+            transforms.Resize(image_size),  # ← 修复：使用处理后的 image_size
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -91,73 +97,62 @@ class Dinov3Backbone:
         source = "local" if self.repo_path else "github"
         LOGGER.info("Loading DINOv3 weights %s from %s", self.config.model_name, repo)
 
-        model: Optional[torch.nn.Module] = None
+        # ====== 使用 CPU Offload + 单 GPU ======
         try:
-            model = torch.hub.load(
-                repo,
-                self.config.model_name,
-                trust_repo=True,
-                source=source,
-                pretrained=self.config.checkpoint_path is None,
-            )
-        except Exception as hub_error:  # pragma: no cover - torch hub may be unavailable
-            LOGGER.warning("Torch Hub loading failed: %s", hub_error)
-            try:
-                import importlib
+            from accelerate import init_empty_weights, load_checkpoint_and_dispatch, infer_auto_device_map
+        except ImportError:
+            raise ImportError("Please install accelerate: pip install accelerate")
 
+        # 1. 创建空模型
+        with init_empty_weights():
+            try:
+                model = torch.hub.load(
+                    repo,
+                    self.config.model_name,
+                    trust_repo=True,
+                    source=source,
+                    pretrained=False,
+                )
+            except Exception as hub_error:
+                LOGGER.warning("Torch Hub loading failed: %s", hub_error)
+                import importlib
                 module = importlib.import_module("dinov3.models.vision_transformer")
                 constructor = getattr(module, self.config.model_name)
-                model = constructor()
-            except Exception as import_error:  # pragma: no cover - defensive
-                raise RuntimeError(
-                    "Failed to instantiate DINOv3 backbone. Ensure the official repo is available "
-                    "via `repo_path` or installed as a package."
-                ) from import_error
+                model = constructor(pretrained=False)
 
-        if model is None:  # pragma: no cover - defensive
+        if model is None:
             raise RuntimeError("DINOv3 model initialization returned None")
 
-        if self.config.checkpoint_path:
-            state = torch.load(self.config.checkpoint_path, map_location="cpu")
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            if missing:
-                LOGGER.warning("Missing parameters when loading checkpoint: %s", missing[:5])
-            if unexpected:
-                LOGGER.warning("Unexpected parameters when loading checkpoint: %s", unexpected[:5])
+        # 2. 自动推断设备映射（GPU + CPU offload）
+        device_map = infer_auto_device_map(
+            model,
+            max_memory={0: "20GiB", "cpu": "100GiB"},  # GPU 0 预留 4GB，剩余用 CPU
+            no_split_module_classes=["Block"],         # 不切分 Transformer Block
+            dtype=torch.float16,
+        )
         
-        model = model.to(device='cpu', dtype=self.dtype)
-    
-        # 使用 DataParallel 或手动分片
-        if torch.cuda.device_count() > 1:
-            print(f"   Using {torch.cuda.device_count()} GPUs")
-            model = torch.nn.DataParallel(model)
+        LOGGER.info("Device map: %s", device_map)
+
+        # 3. 加载权重并分配
+        if not self.config.checkpoint_path:
+            raise ValueError("checkpoint_path is required")
         
-        # 然后移动到 GPU
-        model = model.to(device=self.device)
+        model = load_checkpoint_and_dispatch(
+            model,
+            checkpoint=self.config.checkpoint_path,
+            device_map=device_map,
+            no_split_module_classes=["Block"],
+            dtype=torch.float16,
+            offload_folder="offload_tmp",  # CPU offload 临时目录
+            offload_state_dict=True,
+        )
+        
+        # 4. 设置主设备
+        self.device = torch.device("cuda:0")
+        LOGGER.info("Model loaded with CPU offload")
         
         return model
 
-        # Attempt to infer patch size from the loaded model for consistency checks
-        patch_size = getattr(self.config, "patch_size", None)
-        inferred_patch: Optional[int] = None
-        if hasattr(model, "patch_embed"):
-            embed = getattr(model, "patch_embed")
-            if hasattr(embed, "patch_size"):
-                raw_size = embed.patch_size
-                if isinstance(raw_size, tuple):
-                    inferred_patch = int(raw_size[0])
-                elif isinstance(raw_size, int):
-                    inferred_patch = int(raw_size)
-        if inferred_patch and inferred_patch > 0:
-            if patch_size and patch_size != inferred_patch:
-                LOGGER.warning(
-                    "Configured patch size %d differs from model patch size %d; using model value",
-                    patch_size,
-                    inferred_patch,
-                )
-            object.__setattr__(self.config, "patch_size", inferred_patch)
-
-        return model
     
     def _prepare(self, image: np.ndarray) -> torch.Tensor:
         tensor = self.transform(image).unsqueeze(0)
