@@ -53,6 +53,10 @@ class PromptStrategyConfig:
     include_masks: bool = True
     max_points_per_region: int = 3
     grid_points_per_side: int = 0
+    min_score: float = 0.0
+    max_prompts: int = 128
+    max_prompts_per_class: int = 0
+    nms_iou_threshold: float = 0.5
 
 
 @dataclass

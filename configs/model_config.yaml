@@ -53,6 +53,10 @@ prompts:
   include_masks: true
   max_points_per_region: 3
   grid_points_per_side: 0
+  min_score: 0.15
+  max_prompts: 80
+  max_prompts_per_class: 20
+  nms_iou_threshold: 0.5
 
 instance_grouping:
   method: "connected_components"
