@@ -1,7 +1,6 @@
 """Detection adapter working with DINOv3 patch tokens."""
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -12,6 +11,7 @@ import torch.nn.functional as F
 
 from ..pipeline_types import DetectionOutput
 from ..utils import LOGGER
+from .loading import load_adapter_checkpoint
 
 
 @dataclass
@@ -44,36 +44,12 @@ def build_detection_adapter(
         dtype=torch_dtype,
     )
 
-    # Load checkpoint if exists
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            # Try to load compatible weights
-            if "model" in checkpoint:
-                state_dict = checkpoint["model"]
-            elif "state_dict" in checkpoint:
-                state_dict = checkpoint["state_dict"]
-            else:
-                state_dict = checkpoint
-            
-            # Filter and load compatible keys
-            model_dict = adapter.model.state_dict()
-            compatible_dict = {
-                k: v for k, v in state_dict.items()
-                if k in model_dict and v.shape == model_dict[k].shape
-            }
-            
-            if compatible_dict:
-                adapter.model.load_state_dict(compatible_dict, strict=False)
-                LOGGER.info(f"✓ Loaded {len(compatible_dict)} compatible parameters")
-            else:
-                LOGGER.warning("No compatible parameters found in checkpoint")
-                
-        except Exception as e:
-            LOGGER.warning(f"Failed to load checkpoint: {e}")
-            LOGGER.info("Using randomly initialized weights")
+    if checkpoint_path:
+        loaded = load_adapter_checkpoint(adapter.model, checkpoint_path, "Detection")
+        if loaded == 0:
+            LOGGER.info("Detection adapter will operate with randomly initialized weights")
     else:
-        LOGGER.info("No checkpoint provided, using randomly initialized weights")
+        LOGGER.info("Detection adapter: no checkpoint provided, using randomly initialized weights")
 
     adapter.model = adapter.model.to(device=device, dtype=torch_dtype)
     adapter.model.eval()

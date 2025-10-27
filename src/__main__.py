@@ -145,10 +145,17 @@ def _build_segmentation_palette(num_classes: int) -> np.ndarray:
 def _save_detection_visualization(
     detection: DetectionOutput,
     output_dir: Path,
-    image_rgb: np.ndarray,
-    processed_shape: Tuple[int, int],
+    image_rgb: Optional[np.ndarray] = None,
+    processed_shape: Optional[Tuple[int, int]] = None,
 ) -> None:
     if detection.boxes.size == 0:
+        return
+
+    if image_rgb is None or processed_shape is None:
+        LOGGER.warning(
+            "Skipping detection visualization because image data or processed"
+            " shape was not provided."
+        )
         return
 
     base_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
@@ -253,173 +260,6 @@ def _save_adapter_metadata(
     if segmentation.class_names:
         metadata["segmentation_class_names"] = list(segmentation.class_names)
     save_json(output_dir / "metadata.json", metadata)
-
-
-def _save_prompt_visualization(result: PipelineResult, output_dir: Path) -> None:
-    if not result.prompts:
-        return
-
-    image_rgb = result.original_image
-    base_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    height, width = result.original_shape
-    processed_h, processed_w = result.processed_shape
-    scale_x = width / max(1, processed_w)
-    scale_y = height / max(1, processed_h)
-
-    for idx, prompt in enumerate(result.prompts):
-        color = _PALETTE[idx % len(_PALETTE)]
-        if prompt.box != (0, 0, 0, 0):
-            scaled_box = _scale_box(prompt.box, scale_x, scale_y, width, height)
-            cv2.rectangle(base_bgr, (scaled_box[0], scaled_box[1]), (scaled_box[2], scaled_box[3]), color, 1)
-        if prompt.point != (0, 0):
-            x = int(round(prompt.point[0] * scale_x))
-            y = int(round(prompt.point[1] * scale_y))
-            x = max(0, min(width - 1, x))
-            y = max(0, min(height - 1, y))
-            cv2.circle(base_bgr, (x, y), 3, color, -1)
-        cv2.putText(
-            base_bgr,
-            str(idx),
-            (10, 20 + 15 * idx),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
-    cv2.imwrite(str(output_dir / "prompts.png"), base_bgr)
-
-
-def _save_instance_overlay(instances: List[InstancePrediction], output_dir: Path, base_image: np.ndarray) -> None:
-    if not instances:
-        return
-
-    base_bgr = cv2.cvtColor(base_image, cv2.COLOR_RGB2BGR)
-    overlay = np.zeros_like(base_bgr)
-
-    for idx, instance in enumerate(instances):
-        mask = instance.mask.astype(bool)
-        if mask.shape[:2] != base_bgr.shape[:2]:
-            resized = _resize_map(mask.astype(np.float32), base_bgr.shape[:2]) >= 0.5
-            mask = resized
-        color = _PALETTE[idx % len(_PALETTE)]
-        overlay[mask] = color
-
-    blended = cv2.addWeighted(base_bgr, 0.6, overlay, 0.4, 0.0)
-    cv2.imwrite(str(output_dir / "instances_overlay.png"), blended)
-
-
-_PALETTE: List[Tuple[int, int, int]] = [
-    (240, 86, 60),
-    (67, 160, 71),
-    (66, 133, 244),
-    (171, 71, 188),
-    (255, 202, 40),
-    (38, 198, 218),
-    (255, 112, 67),
-    (124, 179, 66),
-]
-
-
-def _normalize_to_uint8(data: np.ndarray) -> np.ndarray:
-    finite = np.isfinite(data)
-    if not finite.any():
-        return np.zeros_like(data, dtype=np.uint8)
-    clipped = np.zeros_like(data, dtype=np.float32)
-    clipped[finite] = data[finite]
-    minimum = float(clipped[finite].min())
-    maximum = float(clipped[finite].max())
-    if maximum - minimum < 1e-6:
-        return np.zeros_like(clipped, dtype=np.uint8)
-    normalized = (clipped - minimum) / (maximum - minimum)
-    normalized = np.clip(normalized, 0.0, 1.0)
-    return (normalized * 255).astype(np.uint8)
-
-
-def _resize_map(map_2d: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
-    if map_2d.shape == shape:
-        return map_2d
-    height, width = shape
-    return cv2.resize(map_2d, (width, height), interpolation=cv2.INTER_CUBIC)
-
-
-def _segmentation_foreground(segmentation_probs: np.ndarray) -> np.ndarray:
-    if segmentation_probs.ndim != 3:
-        raise ValueError("Expected segmentation probabilities with shape (C, H, W)")
-    if segmentation_probs.shape[0] == 1:
-        return segmentation_probs[0]
-    return segmentation_probs.max(axis=0)
-
-
-def _save_heatmap_images(
-    map_2d: np.ndarray,
-    output_dir: Path,
-    stem: str,
-    base_image_rgb: Optional[np.ndarray],
-) -> None:
-    heatmap_uint8 = _normalize_to_uint8(map_2d)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_VIRIDIS)
-    cv2.imwrite(str(output_dir / f"{stem}_heatmap.png"), heatmap_color)
-
-    if base_image_rgb is not None:
-        base_bgr = cv2.cvtColor(base_image_rgb, cv2.COLOR_RGB2BGR)
-        overlay = cv2.addWeighted(base_bgr, 0.6, heatmap_color, 0.4, 0.0)
-        cv2.imwrite(str(output_dir / f"{stem}_overlay.png"), overlay)
-
-
-def _scale_box(
-    box: Tuple[float, float, float, float],
-    scale_x: float,
-    scale_y: float,
-    width: int,
-    height: int,
-) -> Tuple[int, int, int, int]:
-    x1 = int(round(box[0] * scale_x))
-    y1 = int(round(box[1] * scale_y))
-    x2 = int(round(box[2] * scale_x))
-    y2 = int(round(box[3] * scale_y))
-    x1 = max(0, min(width - 1, x1))
-    y1 = max(0, min(height - 1, y1))
-    x2 = max(0, min(width - 1, x2))
-    y2 = max(0, min(height - 1, y2))
-    return x1, y1, x2, y2
-
-
-def _save_detection_visualization(result: PipelineResult, output_dir: Path) -> None:
-    if result.detection.boxes.size == 0:
-        return
-
-    image_rgb = result.original_image
-    base_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    height, width = result.original_shape
-    processed_h, processed_w = result.processed_shape
-    scale_x = width / max(1, processed_w)
-    scale_y = height / max(1, processed_h)
-
-    for idx, (box, score, cls_id) in enumerate(
-        zip(result.detection.boxes, result.detection.scores, result.detection.class_ids)
-    ):
-        color = _PALETTE[idx % len(_PALETTE)]
-        scaled = _scale_box(tuple(box), scale_x, scale_y, width, height)
-        cv2.rectangle(base_bgr, (scaled[0], scaled[1]), (scaled[2], scaled[3]), color, 2)
-        class_name = None
-        if result.detection.class_names and int(cls_id) < len(result.detection.class_names):
-            class_name = result.detection.class_names[int(cls_id)]
-        label = class_name or str(int(cls_id))
-        text = f"{label}:{float(score):.2f}"
-        cv2.putText(
-            base_bgr,
-            text,
-            (scaled[0], max(15, scaled[1] - 4)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
-    cv2.imwrite(str(output_dir / "detections.png"), base_bgr)
 
 
 def _save_prompt_visualization(result: PipelineResult, output_dir: Path) -> None:
