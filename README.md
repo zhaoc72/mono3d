@@ -47,8 +47,7 @@ Set the Virtual KITTI 2 dataset root to `/media/pc/D/datasets/vkitti2` for the h
 ## Running Inference
 
 ```bash
-python -m src.inference_pipeline \
-  image \
+python -m src image \
   --input path/to/image.png \
   --output outputs/run_001 \
   --config configs/model_config.yaml \
@@ -56,6 +55,31 @@ python -m src.inference_pipeline \
 ```
 
 For directory processing replace `image` with `directory` and provide a directory path, or use `video` for video files.
+
+### Zero-shot class-aware pipeline
+
+The default configuration wires together the official DINOv3 backbone, detection adapter, segmentation adapter,
+and SAM2 checkpoint without any additional training. When the detection/segmentation adapters are configured, the CLI
+automatically switches to the class-aware fusion pipeline:
+
+1. **DINOv3 backbone** produces patch tokens, attention maps, and an objectness heatmap.
+2. **Detection adapter** (e.g., `coco_detr_head`) yields class-aware bounding boxes and category scores.
+3. **Segmentation adapter** (e.g., `ade20k_m2f_head`) returns per-class probability maps.
+4. The pipeline intersects the objectness map, detection boxes, and segmentation probabilities to obtain clean,
+   class-labelled prompts (points/boxes/optional mask seeds) that cover foreground instances only.
+5. **SAM2** refines each prompt into a high-quality instance mask; the detection adapter class names are attached to
+   the final predictions.
+
+All steps operate in zero-shot mode—only the published checkpoints are required. To export detailed intermediate
+visualizations (feature grids, adapter outputs, prompts, and masks) during inference:
+
+```bash
+python -m src image \
+  --input /media/pc/D/datasets/vkitti2/Scene01/clone/frames/rgb/Camera_0/rgb_00061.jpg \
+  --output outputs/hdbscan \
+  --config configs/model_config.yaml \
+  --visualize-intermediate
+```
 
 To run on the VKITTI2 dataset end-to-end:
 
@@ -71,7 +95,7 @@ To run on the VKITTI2 dataset end-to-end:
 Advanced usage allows filtering scenes/clones and limiting frame counts:
 
 ```bash
-python -m src.inference_pipeline vkitti \
+python -m src vkitti \
   --input /media/pc/D/datasets/vkitti2 \
   --output outputs/vkitti_subset \
   --config configs/model_config.yaml \

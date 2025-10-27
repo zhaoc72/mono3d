@@ -169,3 +169,39 @@ reconstruction:
   save_metadata: true
   metadata_keys: []
   mask_extension: ".npy"
+
+class_aware:
+  enable: null  # 留空表示当检测/分割 adapter 都配置后自动启用（零训练 Zero-Shot 模式）
+  detection_adapter:
+    target: "dinov3.adapters.detection:build_coco_adapter"  # 使用官方 DINOv3 COCO DETR adapter
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
+    python_paths:
+      - "/media/pc/D/zhaochen/mono3d/dinov3"  # 指向本地克隆的 DINOv3 仓库
+    kwargs: {}
+  segmentation_adapter:
+    target: "dinov3.adapters.segmentation:build_ade20k_adapter"  # 使用官方 ADE20K 语义分割 adapter
+    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
+    python_paths:
+      - "/media/pc/D/zhaochen/mono3d/dinov3"
+    kwargs: {}
+  prompt_fusion:
+    objectness_threshold: 0.45
+    segmentation_threshold: 0.4
+    class_probability_threshold: 0.35
+    detection_score_threshold: 0.25
+    min_component_area: 60
+    min_prompt_area: 60
+    max_prompts_per_class: 10
+    nms_iou_threshold: 0.6
+    score_weights:
+      det: 0.4
+      seg: 0.4
+      obj: 0.2
+    include_mask_prompts: true
+  prompt_postprocess:
+    enable: true
+    closing_kernel: 5
+    opening_kernel: 3
+    min_instance_area: 60
+  foreground_class_ids: null
+  background_class_ids: [0]

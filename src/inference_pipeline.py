@@ -108,6 +108,8 @@ class PipelineResult:
     cluster_centroids: Optional[np.ndarray]
     superpixel_labels: Optional[np.ndarray] = None  # 新增
     prompt_descriptions: List[Dict[str, Any]] = field(default_factory=list)
+    patch_map: Optional[np.ndarray] = None
+    processed_shape: Optional[Tuple[int, int]] = None
 
 
 class ZeroShotSegmentationPipeline:
@@ -1107,6 +1109,7 @@ class ZeroShotSegmentationPipeline:
         patch_map = feats["patch_map"]
         if hasattr(patch_map, "detach"):
             patch_map = patch_map.detach().cpu().numpy()
+        processed_shape = tuple(feats.get("processed_image_shape", image.shape[:2]))
 
         attention_map = feats.get("attention_map")
         attention_resized = self._resize_guidance_map(attention_map, image.shape[:2])
@@ -1215,6 +1218,8 @@ class ZeroShotSegmentationPipeline:
                 centroids,
                 superpixel_labels,
                 [],
+                patch_map,
+                processed_shape,
             )
 
         proposals = expand_region_instances(
@@ -1359,6 +1364,8 @@ class ZeroShotSegmentationPipeline:
             centroids,
             superpixel_labels,
             final_descriptions,
+            patch_map,
+            processed_shape,
         )
 
 

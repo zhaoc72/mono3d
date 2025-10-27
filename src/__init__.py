@@ -1,3 +1,27 @@
-"""Zero-shot instance segmentation pipeline combining DINOv3 and SAM2."""
+"""Zero-shot instance segmentation pipelines and utilities."""
 
-__all__ = []
+from .class_aware_pipeline import (
+    ClassAwareInstance,
+    ClassAwarePipelineResult,
+    ClassAwarePrompt,
+    ClassAwarePromptPipeline,
+    DetectionAdapter,
+    DetectionOutput,
+    PromptFusionConfig,
+    PromptPostProcessConfig,
+    SegmentationAdapter,
+    SegmentationOutput,
+)
+
+__all__ = [
+    "ClassAwareInstance",
+    "ClassAwarePipelineResult",
+    "ClassAwarePrompt",
+    "ClassAwarePromptPipeline",
+    "DetectionAdapter",
+    "DetectionOutput",
+    "PromptFusionConfig",
+    "PromptPostProcessConfig",
+    "SegmentationAdapter",
+    "SegmentationOutput",
+]

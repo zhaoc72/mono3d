@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
+import os
+import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,6 +17,12 @@ import numpy as np
 from .data_loader import load_image, load_video_frames, stream_directory_images
 from .datasets.vkitti import VkittiFilter, iter_vkitti_frames
 from .dinov3_feature import DINOv3FeatureExtractor, Dinov3Config
+from .class_aware_pipeline import (
+    ClassAwarePipelineResult,
+    ClassAwarePromptPipeline,
+    PromptFusionConfig,
+    PromptPostProcessConfig,
+)
 from .inference_pipeline import (
     AutoSuperpixelConfig,
     PipelineConfig,
@@ -73,15 +83,92 @@ def parse_args() -> argparse.Namespace:
 def load_configs(config_path: str, prompt_config_path: Optional[str] = None) -> dict:
     """Load configuration files."""
     config = load_yaml(config_path)
-    
+
     if prompt_config_path:
         prompt_config = load_yaml(prompt_config_path)
         config["prompt_config_yaml"] = prompt_config
-    
+
     return config
 
 
-def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
+def _maybe_extend_sys_path(paths: Sequence[str]) -> None:
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        expanded = os.path.expanduser(str(raw_path))
+        if expanded in sys.path:
+            continue
+        if os.path.isdir(expanded) or (os.path.isfile(expanded) and expanded.endswith(".py")):
+            sys.path.insert(0, expanded)
+
+
+def _invoke_factory(factory: Any, kwargs: Dict[str, Any]) -> Any:
+    if not callable(factory):
+        raise TypeError(f"Adapter factory {factory!r} is not callable")
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return factory(**kwargs)
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        return factory(**kwargs)
+    filtered = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return factory(**filtered)
+
+
+def _instantiate_adapter(
+    adapter_cfg: Dict[str, Any],
+    device: str,
+    dtype: Any,
+    extra_paths: Sequence[str] = (),
+) -> Any:
+    if not adapter_cfg:
+        raise ValueError("Adapter configuration must be provided when class-aware mode is enabled")
+    target = adapter_cfg.get("target")
+    if not target:
+        raise ValueError("Adapter configuration requires a 'target' callable path")
+
+    python_paths = adapter_cfg.get("python_paths") or []
+    if isinstance(python_paths, str):
+        python_paths = [python_paths]
+    _maybe_extend_sys_path(list(extra_paths) + list(python_paths))
+
+    module_path, _, attr = target.partition(":")
+    if not attr:
+        raise ValueError(f"Invalid adapter target '{target}'. Use 'module.submodule:callable'")
+
+    LOGGER.info("Loading adapter factory %s", target)
+    module = importlib.import_module(module_path)
+    factory: Any = module
+    for part in attr.split("."):
+        factory = getattr(factory, part)
+
+    kwargs = dict(adapter_cfg.get("kwargs", {}))
+    if "checkpoint_path" in adapter_cfg and "checkpoint_path" not in kwargs:
+        kwargs["checkpoint_path"] = adapter_cfg["checkpoint_path"]
+
+    dtype_name = getattr(dtype, "__str__", lambda: str(dtype))()
+    defaults: Dict[str, Any] = {
+        "device": device,
+        "torch_dtype": dtype,
+        "dtype": dtype,
+        "dtype_str": dtype_name,
+    }
+    for key, value in defaults.items():
+        kwargs.setdefault(key, value)
+
+    try:
+        adapter = _invoke_factory(factory, kwargs)
+    except Exception as exc:  # pragma: no cover - informative logging
+        raise RuntimeError(f"Failed to instantiate adapter '{target}': {exc}") from exc
+
+    return adapter
+
+
+def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline | ClassAwarePromptPipeline:
     """Build the segmentation pipeline from configuration."""
     device = config.get("device", "cuda")
     dtype = to_torch_dtype(config.get("dtype", "float32"))
@@ -215,10 +302,63 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
     LOGGER.info("Loading models...")
     extractor = DINOv3FeatureExtractor(dinov3_cfg, device, dtype)
     LOGGER.info("✓ DINOv3 loaded")
-    
+
     segmenter = SAM2Segmenter(sam2_cfg, device, dtype)
     LOGGER.info("✓ SAM2 loaded")
-    
+
+    class_aware_cfg: Dict[str, Any] = config.get("class_aware", {}) or {}
+    detection_cfg = class_aware_cfg.get("detection_adapter")
+    segmentation_cfg = class_aware_cfg.get("segmentation_adapter")
+
+    enable_flag = class_aware_cfg.get("enable")
+    if enable_flag is None:
+        enable_flag = bool(detection_cfg and segmentation_cfg)
+
+    if enable_flag:
+        LOGGER.info("Class-aware fusion enabled; initializing adapters...")
+        if detection_cfg is None or segmentation_cfg is None:
+            raise ValueError(
+                "Class-aware pipeline requires detection_adapter and segmentation_adapter configuration"
+            )
+
+        repo_path = config.get("dinov3", {}).get("repo_or_dir")
+        extra_paths: List[str] = []
+        if repo_path:
+            extra_paths.append(repo_path)
+
+        detection_adapter = _instantiate_adapter(detection_cfg, device, dtype, extra_paths)
+        segmentation_adapter = _instantiate_adapter(segmentation_cfg, device, dtype, extra_paths)
+
+        LOGGER.info(
+            "DINOv3 backbone features + detection adapter + segmentation adapter → class-aware prompts"
+        )
+        LOGGER.info("No fine-tuning required: all modules run in zero-shot mode with official checkpoints")
+
+        fusion_cfg = PromptFusionConfig(**class_aware_cfg.get("prompt_fusion", {}))
+        post_cfg = PromptPostProcessConfig(**class_aware_cfg.get("prompt_postprocess", {}))
+        foreground_ids = class_aware_cfg.get("foreground_class_ids")
+        background_ids = class_aware_cfg.get("background_class_ids")
+
+        LOGGER.info(
+            "✓ Class-aware zero-shot prompt pipeline ready (foreground classes: %s)",
+            foreground_ids if foreground_ids is not None else "auto",
+        )
+
+        return ClassAwarePromptPipeline(
+            dinov3_cfg,
+            sam2_cfg,
+            fusion_cfg,
+            post_cfg,
+            detection_adapter,
+            segmentation_adapter,
+            foreground_class_ids=foreground_ids,
+            background_class_ids=background_ids,
+            device=device,
+            dtype=dtype,
+            extractor=extractor,
+            segmenter=segmenter,
+        )
+
     return ZeroShotSegmentationPipeline(
         dinov3_cfg,
         sam2_cfg,
@@ -230,6 +370,82 @@ def build_pipeline(config: dict) -> ZeroShotSegmentationPipeline:
     )
 
 
+def _normalize_to_uint8(data: np.ndarray) -> np.ndarray:
+    array = np.asarray(data, dtype=np.float32)
+    array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    min_val = float(array.min()) if array.size else 0.0
+    max_val = float(array.max()) if array.size else 0.0
+    if max_val - min_val < 1e-6:
+        return np.zeros_like(array, dtype=np.uint8)
+    normalized = (array - min_val) / (max_val - min_val)
+    return (np.clip(normalized, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def _normalize_channel(channel: np.ndarray) -> np.ndarray:
+    channel = np.asarray(channel, dtype=np.float32)
+    channel = np.nan_to_num(channel, nan=0.0, posinf=0.0, neginf=0.0)
+    min_val = float(channel.min()) if channel.size else 0.0
+    max_val = float(channel.max()) if channel.size else 0.0
+    if max_val - min_val < 1e-6:
+        return np.zeros_like(channel, dtype=np.float32)
+    return (channel - min_val) / (max_val - min_val)
+
+
+def _feature_map_to_rgb(feature_map: Optional[np.ndarray], image_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    if feature_map is None:
+        return None
+    feature = np.asarray(feature_map, dtype=np.float32)
+    if feature.ndim == 2:
+        feature = feature[..., None]
+    if feature.ndim != 3:
+        return None
+    channels = feature.shape[-1]
+    if channels < 3:
+        feature = np.repeat(feature, 3, axis=-1)
+    else:
+        feature = feature[..., :3]
+    normalized = np.stack([
+        _normalize_channel(feature[..., idx]) for idx in range(3)
+    ], axis=-1)
+    rgb = (np.clip(normalized, 0.0, 1.0) * 255).astype(np.uint8)
+    height, width = image_shape
+    if rgb.shape[0] != height or rgb.shape[1] != width:
+        if cv2 is not None:
+            rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_CUBIC)
+        else:  # pragma: no cover - minimal fallback
+            scale_y = max(1, int(np.round(height / max(rgb.shape[0], 1))))
+            scale_x = max(1, int(np.round(width / max(rgb.shape[1], 1))))
+            rgb = np.kron(rgb, np.ones((scale_y, scale_x, 1), dtype=np.uint8))
+            rgb = rgb[:height, :width, :]
+    return rgb
+
+
+def _resize_map_to_image(
+    array: np.ndarray,
+    image_shape: Tuple[int, int],
+    nearest: bool = False,
+) -> np.ndarray:
+    height, width = image_shape
+    if array.shape == (height, width):
+        return array
+    if cv2 is not None:
+        interpolation = cv2.INTER_NEAREST if nearest else cv2.INTER_CUBIC
+        return cv2.resize(array, (width, height), interpolation=interpolation)
+    # pragma: no cover - minimal fallback when OpenCV is unavailable
+    scale_y = max(1, int(np.round(height / max(array.shape[0], 1))))
+    scale_x = max(1, int(np.round(width / max(array.shape[1], 1))))
+    resized = np.kron(array, np.ones((scale_y, scale_x), dtype=array.dtype))
+    return resized[:height, :width]
+
+
+def _class_color(class_id: int) -> Tuple[int, int, int]:
+    seed = int(class_id)
+    return (
+        (seed * 97 + 37) % 255,
+        (seed * 57 + 19) % 255,
+        (seed * 139 + 73) % 255,
+    )
+
 def visualize_intermediate_results(
     image: np.ndarray,
     result,
@@ -237,203 +453,262 @@ def visualize_intermediate_results(
     stem: str
 ):
     """可视化中间过程结果"""
-    
+
     viz_dir = output_dir / "intermediate" / stem
     viz_dir.mkdir(parents=True, exist_ok=True)
-    
+
     LOGGER.info(f"Saving intermediate visualizations to {viz_dir}")
-    
-    # 1. 保存原图
-    cv2.imwrite(
-        str(viz_dir / "01_original.jpg"),
-        cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    )
-    
-    # 2. 可视化 Attention Map (如果有)
-    if result.attention_map is not None:
-        attention_norm = (result.attention_map * 255).astype(np.uint8)
-        attention_colored = cv2.applyColorMap(attention_norm, cv2.COLORMAP_JET)
-        
-        cv2.imwrite(str(viz_dir / "02_attention_map.jpg"), attention_colored)
-        
-        attention_resized = cv2.resize(attention_colored, (image.shape[1], image.shape[0]))
-        overlay = cv2.addWeighted(
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.6,
-            attention_resized, 0.4, 0
-        )
-        cv2.imwrite(str(viz_dir / "02_attention_overlay.jpg"), overlay)
-    
-    # 3. 可视化 Objectness Map (如果有)
-    if result.objectness_map is not None:
-        objectness_norm = (result.objectness_map * 255).astype(np.uint8)
-        objectness_colored = cv2.applyColorMap(objectness_norm, cv2.COLORMAP_JET)
-        
-        cv2.imwrite(str(viz_dir / "03_objectness_map.jpg"), objectness_colored)
-        
-        objectness_resized = cv2.resize(objectness_colored, (image.shape[1], image.shape[0]))
-        overlay = cv2.addWeighted(
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.6,
-            objectness_resized, 0.4, 0
-        )
-        cv2.imwrite(str(viz_dir / "03_objectness_overlay.jpg"), overlay)
-    
-    # 4. 可视化聚类 Label Map
-    if result.label_map is not None:
-        unique_labels = np.unique(result.label_map)
-        colored_labels = np.zeros((*result.label_map.shape, 3), dtype=np.uint8)
-        
-        for label in unique_labels:
-            color = np.array([
-                (int(label) * 50) % 255,
-                (int(label) * 80 + 60) % 255,
-                (int(label) * 120 + 30) % 255
-            ], dtype=np.uint8)
-            colored_labels[result.label_map == label] = color
-        
-        colored_labels_resized = cv2.resize(
-            colored_labels,
-            (image.shape[1], image.shape[0]),
-            interpolation=cv2.INTER_NEAREST
-        )
-        
-        cv2.imwrite(
-            str(viz_dir / "04_cluster_labels.jpg"),
-            cv2.cvtColor(colored_labels_resized, cv2.COLOR_RGB2BGR)
-        )
-        
-        overlay = cv2.addWeighted(
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5,
-            cv2.cvtColor(colored_labels_resized, cv2.COLOR_RGB2BGR), 0.5, 0
-        )
-        cv2.imwrite(str(viz_dir / "04_cluster_overlay.jpg"), overlay)
-    
-    # 5. 可视化 Proposals (Bounding Boxes)
-    if result.proposals:
-        img_with_boxes = image.copy()
-        
-        for i, proposal in enumerate(result.proposals):
-            x0, y0, x1, y1 = proposal.bbox
-            
-            obj_score = proposal.objectness
-            color_r = int(255 * (1 - obj_score))
-            color_g = int(255 * obj_score)
-            color = (color_g, color_r, 0)
-            
-            cv2.rectangle(img_with_boxes, (x0, y0), (x1, y1), color, 2)
-            
-            label = f"#{i} obj:{obj_score:.2f}"
+
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    height, width = image.shape[:2]
+    image_shape = (height, width)
+    is_class_aware = isinstance(result, ClassAwarePipelineResult)
+
+    summary_lines: List[str] = []
+    summary_lines.append("=== Input ===")
+    summary_lines.append(f"Image size: {width}x{height}")
+
+    cv2.imwrite(str(viz_dir / "01_original.jpg"), image_bgr)
+
+    # Feature map
+    feature_map = getattr(result, "patch_map", None)
+    feature_rgb = _feature_map_to_rgb(feature_map, image_shape)
+    if feature_rgb is not None:
+        cv2.imwrite(str(viz_dir / "02_feature_map.jpg"), cv2.cvtColor(feature_rgb, cv2.COLOR_RGB2BGR))
+
+    # Attention map
+    attention_map = getattr(result, "attention_map", None)
+    if attention_map is not None:
+        attn_resized = _resize_map_to_image(attention_map, image_shape)
+        attn_norm = _normalize_to_uint8(attn_resized)
+        attn_color = cv2.applyColorMap(attn_norm, cv2.COLORMAP_JET)
+        cv2.imwrite(str(viz_dir / "03_attention_map.jpg"), attn_color)
+        attention_overlay = cv2.addWeighted(image_bgr, 0.6, attn_color, 0.4, 0)
+        cv2.imwrite(str(viz_dir / "03_attention_overlay.jpg"), attention_overlay)
+
+    # Objectness map
+    objectness_map = getattr(result, "objectness_map", None)
+    if objectness_map is not None:
+        obj_resized = _resize_map_to_image(objectness_map, image_shape)
+        obj_norm = _normalize_to_uint8(obj_resized)
+        obj_color = cv2.applyColorMap(obj_norm, cv2.COLORMAP_JET)
+        cv2.imwrite(str(viz_dir / "04_objectness_map.jpg"), obj_color)
+        obj_overlay = cv2.addWeighted(image_bgr, 0.6, obj_color, 0.4, 0)
+        cv2.imwrite(str(viz_dir / "04_objectness_overlay.jpg"), obj_overlay)
+
+    # Pipeline-specific visualizations
+    if is_class_aware:
+        summary_lines.append("\n=== Class-aware detection ===")
+        detection = result.detection
+        class_names = list(result.segmentation.class_names) if result.segmentation.class_names else []
+        det_canvas = image_bgr.copy()
+        if detection.boxes.size:
+            for idx, (box, class_id, score) in enumerate(
+                zip(detection.boxes, detection.class_ids, detection.scores)
+            ):
+                x1, y1, x2, y2 = map(int, box)
+                color = _class_color(int(class_id))
+                cv2.rectangle(det_canvas, (x1, y1), (x2, y2), color, 2)
+                name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
+                label = f"#{idx} {name}:{score:.2f}"
+                cv2.putText(
+                    det_canvas,
+                    label,
+                    (x1, max(y1 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+                summary_lines.append(
+                    f"  #{idx}: {name} score={score:.3f} box=({x1},{y1},{x2},{y2})"
+                )
+        else:
+            summary_lines.append("  (no detections)")
+        cv2.imwrite(str(viz_dir / "05_detection_boxes.jpg"), det_canvas)
+
+        # Segmentation logits overview
+        seg_probs = result.segmentation_probs
+        if seg_probs.size:
+            seg_canvas = image_bgr.copy()
+            class_map = np.argmax(seg_probs, axis=0).astype(np.int32)
+            class_map_resized = _resize_map_to_image(class_map, image_shape, nearest=True)
+            color_map = np.zeros((height, width, 3), dtype=np.uint8)
+            for class_id in np.unique(class_map_resized):
+                color_map[class_map_resized == class_id] = _class_color(int(class_id))
+            seg_overlay = cv2.addWeighted(seg_canvas, 0.6, color_map, 0.4, 0)
+            cv2.imwrite(str(viz_dir / "06_segmentation_argmax.jpg"), seg_overlay)
+
+            flat = seg_probs.reshape(seg_probs.shape[0], -1)
+            class_scores = flat.mean(axis=1)
+            order = list(np.argsort(class_scores)[::-1])
+            summary_lines.append("\n=== Segmentation confidence (mean per class) ===")
+            for class_idx in order[: min(5, len(order))]:
+                mean_score = float(class_scores[class_idx])
+                name = class_names[class_idx] if class_idx < len(class_names) else f"class_{class_idx}"
+                summary_lines.append(f"  {name}: {mean_score:.3f}")
+
+            for rank, class_idx in enumerate(order[: min(3, len(order))], start=1):
+                heat = _normalize_to_uint8(seg_probs[class_idx])
+                heat_resized = _resize_map_to_image(heat, image_shape)
+                heat_color = cv2.applyColorMap(heat_resized, cv2.COLORMAP_JET)
+                heat_overlay = cv2.addWeighted(image_bgr, 0.6, heat_color, 0.4, 0)
+                class_name = class_names[class_idx] if class_idx < len(class_names) else f"class_{class_idx}"
+                slug = re.sub(r"[^0-9A-Za-z_-]+", "_", class_name).strip("_") or f"class_{class_idx}"
+                cv2.imwrite(
+                    str(viz_dir / f"06_segmentation_heat_{rank}_{slug}.jpg"),
+                    heat_overlay,
+                )
+
+        # Prompts
+        if result.prompts:
+            prompt_canvas = image_bgr.copy()
+            summary_lines.append("\n=== Prompts ===")
+            for idx, prompt in enumerate(result.prompts):
+                color = _class_color(prompt.class_id)
+                x1, y1, x2, y2 = prompt.box
+                cv2.rectangle(prompt_canvas, (x1, y1), (x2, y2), color, 2)
+                cv2.circle(prompt_canvas, prompt.point, 5, color, -1)
+                label = f"{prompt.class_name}:{prompt.score:.2f}"
+                cv2.putText(
+                    prompt_canvas,
+                    label,
+                    (x1, max(y1 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+                if idx < 10:
+                    summary_lines.append(
+                        f"  #{idx}: {prompt.class_name} score={prompt.score:.3f} point={prompt.point}"
+                    )
+            cv2.imwrite(str(viz_dir / "07_prompts.jpg"), prompt_canvas)
+
+        # Final masks
+        instance_canvas = image_bgr.copy()
+        combined = np.zeros_like(image_bgr)
+        summary_lines.append("\n=== Instances ===")
+        for idx, instance in enumerate(result.instances):
+            mask_bool = instance.mask.astype(bool)
+            color = _class_color(instance.class_id)
+            combined[mask_bool] = color
+            x1, y1, x2, y2 = instance.bbox
+            cv2.rectangle(instance_canvas, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
-                img_with_boxes, label, (x0, y0-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
+                instance_canvas,
+                f"{instance.class_name}:{instance.score:.2f}",
+                (x1, max(y1 - 8, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
             )
-        
-        cv2.imwrite(
-            str(viz_dir / "05_proposals_boxes.jpg"),
-            cv2.cvtColor(img_with_boxes, cv2.COLOR_RGB2BGR)
-        )
-    
-    # 6. 可视化 Prompts (Boxes + Points)
-    if result.prompts:
-        img_with_prompts = image.copy()
-        
-        boxes = result.prompts.get('boxes', [])
-        points = result.prompts.get('points', [])
-        labels = result.prompts.get('labels', [])
-        
-        for i, box in enumerate(boxes):
-            x0, y0, x1, y1 = box
-            cv2.rectangle(img_with_prompts, (x0, y0), (x1, y1), (0, 255, 0), 2)
-            cv2.putText(
-                img_with_prompts, f"#{i}", (x0, y0-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2
+            if idx < 10:
+                area = int(instance.mask.astype(np.uint8).sum())
+                summary_lines.append(
+                    f"  #{idx}: {instance.class_name} area={area} bbox={instance.bbox}"
+                )
+        instance_overlay = cv2.addWeighted(instance_canvas, 0.6, combined, 0.4, 0)
+        cv2.imwrite(str(viz_dir / "08_final_masks.jpg"), instance_overlay)
+
+    else:
+        # Default clustering pipeline summaries
+        if result.label_map is not None:
+            summary_lines.append("\n=== Clusters ===")
+            unique_labels = np.unique(result.label_map)
+            colored_labels = np.zeros((*result.label_map.shape, 3), dtype=np.uint8)
+            for label in unique_labels:
+                color = np.array([
+                    (int(label) * 50) % 255,
+                    (int(label) * 80 + 60) % 255,
+                    (int(label) * 120 + 30) % 255,
+                ], dtype=np.uint8)
+                colored_labels[result.label_map == label] = color
+            colored_labels_resized = cv2.resize(
+                colored_labels,
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
             )
-        
-        for i, (prompt_points, prompt_labels) in enumerate(zip(points, labels)):
-            for point, label in zip(prompt_points, prompt_labels):
-                x, y = point
-                color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                cv2.circle(img_with_prompts, (x, y), 5, color, -1)
-        
-        cv2.imwrite(
-            str(viz_dir / "06_prompts.jpg"),
-            cv2.cvtColor(img_with_prompts, cv2.COLOR_RGB2BGR)
-        )
-    
-    # 7. 可视化最终 Masks
-    if result.masks:
-        combined = np.zeros_like(image)
-        
-        for i, mask in enumerate(result.masks):
-            color = np.array([
-                (i * 50) % 255,
-                (i * 80 + 60) % 255,
-                (i * 120 + 30) % 255
-            ], dtype=np.uint8)
-            combined[mask.astype(bool)] = color
-        
-        cv2.imwrite(
-            str(viz_dir / "07_final_masks.jpg"),
-            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
-        )
-        
-        overlay = cv2.addWeighted(
-            cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5,
-            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR), 0.5, 0
-        )
-        cv2.imwrite(str(viz_dir / "07_final_overlay.jpg"), overlay)
-        
-        individual_dir = viz_dir / "individual_masks"
-        individual_dir.mkdir(exist_ok=True)
-        
-        for i, mask in enumerate(result.masks[:10]):
-            mask_vis = (mask.astype(np.uint8) * 255)
-            cv2.imwrite(str(individual_dir / f"mask_{i:02d}.jpg"), mask_vis)
-    
-    # 8. 创建流程总结
-    summary_text = f"""
-=== 中间过程可视化总结 ===
+            cluster_overlay = cv2.addWeighted(
+                image_bgr,
+                0.5,
+                cv2.cvtColor(colored_labels_resized, cv2.COLOR_RGB2BGR),
+                0.5,
+                0,
+            )
+            cv2.imwrite(str(viz_dir / "05_cluster_overlay.jpg"), cluster_overlay)
+            summary_lines.append(f"Clusters: {len(unique_labels)}")
 
-1. 原图: 01_original.jpg
+        if result.proposals:
+            proposal_canvas = image_bgr.copy()
+            summary_lines.append("\n=== Proposals ===")
+            for idx, proposal in enumerate(result.proposals):
+                x0, y0, x1, y1 = proposal.bbox
+                color = (0, 255, 0)
+                cv2.rectangle(proposal_canvas, (x0, y0), (x1, y1), color, 2)
+                label = f"#{idx} obj:{proposal.objectness:.2f}"
+                cv2.putText(
+                    proposal_canvas,
+                    label,
+                    (x0, max(y0 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+                if idx < 10:
+                    summary_lines.append(
+                        f"  #{idx}: objectness={proposal.objectness:.3f} bbox={proposal.bbox}"
+                    )
+            cv2.imwrite(str(viz_dir / "06_proposals_boxes.jpg"), proposal_canvas)
 
-2. DINOv3 特征:
-   - Attention Map: 02_attention_map.jpg
-   - Objectness Map: 03_objectness_map.jpg
+        prompts_dict = getattr(result, "prompts", {}) or {}
+        boxes = prompts_dict.get("boxes", [])
+        points = prompts_dict.get("points", [])
+        labels = prompts_dict.get("labels", [])
+        if boxes or points:
+            prompt_canvas = image_bgr.copy()
+            summary_lines.append("\n=== Prompts ===")
+            for idx, box in enumerate(boxes):
+                x0, y0, x1, y1 = box
+                cv2.rectangle(prompt_canvas, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                cv2.putText(
+                    prompt_canvas,
+                    f"#{idx}",
+                    (x0, max(y0 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    2,
+                )
+            for prompt_points, prompt_labels in zip(points, labels):
+                for point, label_val in zip(prompt_points, prompt_labels):
+                    color = (0, 255, 0) if label_val == 1 else (0, 0, 255)
+                    cv2.circle(prompt_canvas, tuple(point), 5, color, -1)
+            cv2.imwrite(str(viz_dir / "07_prompts.jpg"), prompt_canvas)
 
-3. 聚类结果:
-   - Cluster Labels: 04_cluster_labels.jpg
-   - 聚类数量: {len(np.unique(result.label_map)) if result.label_map is not None else 0}
+        if processed_masks := getattr(result, "masks", []):
+            summary_lines.append("\n=== Masks ===")
+            combined = np.zeros_like(image_bgr)
+            for idx, mask in enumerate(processed_masks):
+                mask_bool = mask.astype(bool)
+                color = np.array([
+                    (idx * 50) % 255,
+                    (idx * 80 + 60) % 255,
+                    (idx * 120 + 30) % 255,
+                ], dtype=np.uint8)
+                combined[mask_bool] = color
+                if idx < 10:
+                    area = int(mask.astype(np.uint8).sum())
+                    summary_lines.append(f"  #{idx}: area={area}")
+            mask_overlay = cv2.addWeighted(image_bgr, 0.6, combined, 0.4, 0)
+            cv2.imwrite(str(viz_dir / "08_final_masks.jpg"), mask_overlay)
 
-4. 候选区域:
-   - Proposals: 05_proposals_boxes.jpg
-   - 候选数量: {len(result.proposals)}
+    summary_path = viz_dir / "README.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
 
-5. SAM2 Prompts:
-   - Prompts: 06_prompts.jpg
-   - Box 数量: {len(result.prompts.get('boxes', []))}
-   - Point 数量: {sum(len(p) for p in result.prompts.get('points', []))}
-
-6. 最终分割:
-   - Final Masks: 07_final_masks.jpg
-   - Mask 数量: {len(result.masks)}
-
-=== 统计信息 ===
-
-Proposals:
-"""
-    
-    for i, proposal in enumerate(result.proposals[:10]):
-        summary_text += f"  #{i}: bbox={proposal.bbox}, obj={proposal.objectness:.3f}, score={proposal.score:.1f}\n"
-    
-    summary_text += f"\nMasks:\n"
-    
-    for i, mask in enumerate(result.masks[:10]):
-        area = mask.sum()
-        ratio = area / (image.shape[0] * image.shape[1]) * 100
-        summary_text += f"  #{i}: area={area:8.0f} px ({ratio:5.2f}%)\n"
-    
-    with open(viz_dir / "README.txt", 'w', encoding='utf-8') as f:
-        f.write(summary_text)
-    
     LOGGER.info(f"✓ Intermediate visualizations saved to {viz_dir}")
 
 
@@ -476,7 +751,7 @@ def postprocess_mask(mask: np.ndarray, kernel_size: int = 7) -> np.ndarray:
 
 
 def process_and_save(
-    pipeline: ZeroShotSegmentationPipeline,
+    pipeline: ZeroShotSegmentationPipeline | ClassAwarePromptPipeline,
     image: np.ndarray,
     output_dir: Path,
     stem: str,
@@ -498,21 +773,39 @@ def process_and_save(
     
     LOGGER.info(f"Processing {stem}...")
     
-    # Run pipeline
-    result = pipeline.run(image, nms_config=nms_config)
-    
-    LOGGER.info(f"Generated {len(result.masks)} masks")
-    
+    is_class_aware = isinstance(pipeline, ClassAwarePromptPipeline)
+
+    if is_class_aware:
+        result = pipeline.run(image)  # type: ignore[assignment]
+    else:
+        result = pipeline.run(image, nms_config=nms_config)
+
+    if is_class_aware:
+        mask_sources = [instance.mask for instance in result.instances]
+        LOGGER.info(f"Generated {len(mask_sources)} class-aware instances")
+    else:
+        LOGGER.info(f"Generated {len(result.masks)} masks")
+
     # 后处理masks
     kernel_size = pipeline_dict.get("kernel_size", 7)
     processed_masks = []
-    for mask in result.masks:
-        processed_mask = postprocess_mask(mask, kernel_size=kernel_size)
-        processed_masks.append(processed_mask)
-    
-    result.masks = processed_masks
+    if is_class_aware:
+        for instance in result.instances:
+            processed_mask = postprocess_mask(instance.mask, kernel_size=kernel_size)
+            instance.mask = processed_mask
+            bbox_mask = np.argwhere(processed_mask > 0)
+            if bbox_mask.size > 0:
+                ys = bbox_mask[:, 0]
+                xs = bbox_mask[:, 1]
+                instance.bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+            processed_masks.append(processed_mask)
+    else:
+        for mask in result.masks:
+            processed_mask = postprocess_mask(mask, kernel_size=kernel_size)
+            processed_masks.append(processed_mask)
+        result.masks = processed_masks
     LOGGER.info(f"Applied morphological post-processing (kernel_size={kernel_size})")
-    
+
     # 可视化中间过程
     if visualize_intermediate:
         visualize_intermediate_results(image, result, output_dir, stem)
@@ -525,29 +818,51 @@ def process_and_save(
     area_threshold = pipeline_dict.get("area_threshold", 100)
     
     valid_count = 0
-    for idx, mask in enumerate(result.masks):
-        area = int(mask.astype(np.uint8).sum())
-        if area >= area_threshold:
-            mask_path = mask_dir / f"mask_{idx:03d}.{mask_format}"
+    if is_class_aware:
+        for idx, instance in enumerate(result.instances):
+            mask = instance.mask.astype(np.uint8)
+            area = int(mask.sum())
+            if area < area_threshold:
+                continue
+            class_slug = re.sub(r"[^0-9A-Za-z_-]+", "_", instance.class_name).strip("_")
+            if not class_slug:
+                class_slug = f"class_{instance.class_id}"
+            mask_path = mask_dir / f"mask_{idx:03d}_{class_slug}.{mask_format}"
             save_mask(mask_path, mask, format_hint=mask_format)
             valid_count += 1
-    
+    else:
+        for idx, mask in enumerate(result.masks):
+            area = int(mask.astype(np.uint8).sum())
+            if area >= area_threshold:
+                mask_path = mask_dir / f"mask_{idx:03d}.{mask_format}"
+                save_mask(mask_path, mask, format_hint=mask_format)
+                valid_count += 1
+
     LOGGER.info(f"Saved {valid_count} valid masks (threshold: {area_threshold})")
-    
+
     # Save visualization
     if save_viz and pipeline_dict.get("save_visualization", True):
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
-        
+
         combined = np.zeros_like(image)
-        for idx, mask in enumerate(result.masks):
-            color = np.array([
-                (idx * 50) % 255,
-                (idx * 80 + 60) % 255,
-                (idx * 120 + 30) % 255,
-            ], dtype=np.uint8)
-            combined[mask.astype(bool)] = color
-        
+        if is_class_aware:
+            for idx, instance in enumerate(result.instances):
+                color = np.array([
+                    (instance.class_id * 67 + 40) % 255,
+                    (idx * 80 + 60) % 255,
+                    (instance.class_id * 97 + 30) % 255,
+                ], dtype=np.uint8)
+                combined[instance.mask.astype(bool)] = color
+        else:
+            for idx, mask in enumerate(result.masks):
+                color = np.array([
+                    (idx * 50) % 255,
+                    (idx * 80 + 60) % 255,
+                    (idx * 120 + 30) % 255,
+                ], dtype=np.uint8)
+                combined[mask.astype(bool)] = color
+
         alpha = pipeline_dict.get("visualization_alpha", 0.5)
         overlay = cv2.addWeighted(
             cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
