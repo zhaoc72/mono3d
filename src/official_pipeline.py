@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import transforms as v2
+from torchvision import transforms
 from PIL import Image
 
-from ..utils import LOGGER
+from .utils import LOGGER
 
 
 class OfficialDINOv3Pipeline:
@@ -23,7 +23,7 @@ class OfficialDINOv3Pipeline:
         device: Optional[str] = None,
     ):
         self.config = config
-        self.official_config = config['dinov3_official']
+        self.official_config = config.get('dinov3_official') or config.get('model', {}).get('dinov3_official', {})
         self.repo_dir = self.official_config['repo_dir']
         
         # 添加官方代码路径到Python路径
@@ -63,135 +63,112 @@ class OfficialDINOv3Pipeline:
         }
         return lookup.get(dtype_str.lower(), torch.bfloat16)
     
-    def _make_transform(self, resize_size: int) -> v2.Compose:
+    def _make_transform(self, resize_size: int) -> transforms.Compose:
         """创建图像预处理pipeline"""
-        to_tensor = v2.ToImage()
-        resize = v2.Resize((resize_size, resize_size), antialias=True)
-        to_float = v2.ToDtype(torch.float32, scale=True)
-        normalize = v2.Normalize(
+        resize = transforms.Resize((resize_size, resize_size))
+        to_tensor = transforms.ToTensor()
+        normalize = transforms.Normalize(
             mean=(0.485, 0.456, 0.406),
             std=(0.229, 0.224, 0.225),
         )
-        return v2.Compose([to_tensor, resize, to_float, normalize])
-    
-    def _load_with_model_parallel(
-        self,
-        model: nn.Module,
-        model_name: str,
-    ) -> nn.Module:
-        """使用模型并行加载大模型"""
-        try:
-            from accelerate import (
-                init_empty_weights,
-                load_checkpoint_and_dispatch,
-                infer_auto_device_map,
-            )
-        except ImportError:
-            raise ImportError("请安装 accelerate: pip install accelerate")
-        
-        LOGGER.info(f"🔄 Loading {model_name} with model parallelism...")
-        
-        # 配置显存分配
-        max_memory = self.multi_gpu_config.get('max_memory', {
-            0: "18GiB",
-            1: "18GiB",
-            2: "18GiB",
-            3: "18GiB",
-            "cpu": "100GiB",
-        })
-        
-        # 推断设备映射
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=["Block"],  # 不切分Transformer块
-            dtype=self.dtype,
-        )
-        
-        # 打印设备分配
-        device_stats = {}
-        for key, device in device_map.items():
-            device_stats[device] = device_stats.get(device, 0) + 1
-        
-        LOGGER.info(f"📊 {model_name} device allocation:")
-        for device in sorted(device_stats.keys()):
-            count = device_stats[device]
-            LOGGER.info(f"   - {device}: {count} modules")
-        
-        return model
+        return transforms.Compose([resize, to_tensor, normalize])
     
     def _load_models(self):
         """加载所有模型"""
         LOGGER.info("=" * 70)
-        LOGGER.info("🧠 Loading DINOv3 Official Models")
+        LOGGER.info("🧠 Loading DINOv3 Official Models (Simplified Loading)")
         LOGGER.info("=" * 70)
         
         backbone_cfg = self.official_config['backbone']
         detection_cfg = self.official_config['detection']
         segmentation_cfg = self.official_config['segmentation']
         
-        # 加载检测模型
-        LOGGER.info(f"\n🎯 Loading detector: {detection_cfg['model_name']}")
-        LOGGER.info(f"   Weights: {detection_cfg['checkpoint_path']}")
-        LOGGER.info(f"   Backbone: {backbone_cfg['checkpoint_path']}")
+        # ========== 策略：只加载一个模型，分时复用 ==========
+        # 由于ViT-7B太大，我们采用：先加载检测器跑推理，然后清空显存，再加载分割器
+        
+        LOGGER.info("\n📝 Note: Using sequential loading strategy due to model size")
+        LOGGER.info("   - Detector and Segmentor will be loaded on-demand")
+        LOGGER.info("   - This saves memory but requires loading twice per image")
+        
+        # 不在初始化时加载模型，而是在推理时按需加载
+        self.detector = None
+        self.segmentor = None
+        
+        # 保存配置供后续加载使用
+        self.backbone_cfg = backbone_cfg
+        self.detection_cfg = detection_cfg
+        self.segmentation_cfg = segmentation_cfg
+        
+        LOGGER.info("=" * 70)
+        LOGGER.info("✅ Model loading strategy initialized")
+        LOGGER.info("=" * 70)
+
+    def _load_detector_if_needed(self):
+        """按需加载检测器"""
+        if self.detector is not None:
+            return
+        
+        LOGGER.info("🔄 Loading detector on-demand...")
+        
+        # 如果分割器在显存中，先清理
+        if self.segmentor is not None:
+            LOGGER.info("   Clearing segmentor from memory...")
+            del self.segmentor
+            self.segmentor = None
+            torch.cuda.empty_cache()
         
         self.detector = torch.hub.load(
             self.repo_dir,
-            detection_cfg['model_name'],
+            self.detection_cfg['model_name'],
             source="local",
-            weights=detection_cfg['checkpoint_path'],
-            backbone_weights=backbone_cfg['checkpoint_path'],
+            weights=self.detection_cfg['checkpoint_path'],
+            backbone_weights=self.backbone_cfg['checkpoint_path'],
             trust_repo=True,
         )
         
-        if self.use_multi_gpu and self.num_gpus >= 2:
-            self.detector = self._load_with_model_parallel(
-                self.detector, "Detector"
-            )
-        else:
-            self.detector = self.detector.to(self.device, dtype=self.dtype)
-        
+        # 移到GPU 0
+        self.detector = self.detector.to("cuda:3")
         self.detector.eval()
-        LOGGER.info("   ✅ Detector loaded")
         
-        # 加载分割模型
-        LOGGER.info(f"\n🖼️  Loading segmentor: {segmentation_cfg['model_name']}")
-        LOGGER.info(f"   Weights: {segmentation_cfg['checkpoint_path']}")
-        LOGGER.info(f"   Backbone: {backbone_cfg['checkpoint_path']}")
+        LOGGER.info("   ✅ Detector loaded on GPU 3")
+        
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            LOGGER.info(f"   💾 GPU 0: {allocated:.2f}GB allocated")
+
+    def _load_segmentor_if_needed(self):
+        """按需加载分割器"""
+        if self.segmentor is not None:
+            return
+        
+        LOGGER.info("🔄 Loading segmentor on-demand...")
+        
+        # 如果检测器在显存中，先清理
+        if self.detector is not None:
+            LOGGER.info("   Clearing detector from memory...")
+            del self.detector
+            self.detector = None
+            torch.cuda.empty_cache()
         
         self.segmentor = torch.hub.load(
             self.repo_dir,
-            segmentation_cfg['model_name'],
+            self.segmentation_cfg['model_name'],
             source="local",
-            weights=segmentation_cfg['checkpoint_path'],
-            backbone_weights=backbone_cfg['checkpoint_path'],
+            weights=self.segmentation_cfg['checkpoint_path'],
+            backbone_weights=self.backbone_cfg['checkpoint_path'],
             trust_repo=True,
         )
         
-        if self.use_multi_gpu and self.num_gpus >= 2:
-            self.segmentor = self._load_with_model_parallel(
-                self.segmentor, "Segmentor"
-            )
-        else:
-            self.segmentor = self.segmentor.to(self.device, dtype=self.dtype)
-        
+        # 移到GPU 3
+        self.segmentor = self.segmentor.to("cuda:0")
         self.segmentor.eval()
-        LOGGER.info("   ✅ Segmentor loaded")
         
-        # 打印显存使用情况
+        LOGGER.info("   ✅ Segmentor loaded on GPU 0")
+        
         if torch.cuda.is_available():
-            LOGGER.info("\n🎯 GPU Memory Status:")
-            for i in range(min(self.num_gpus, 4)):
-                allocated = torch.cuda.memory_allocated(i) / 1024**3
-                reserved = torch.cuda.memory_reserved(i) / 1024**3
-                LOGGER.info(
-                    f"   GPU {i}: {allocated:.2f}GB allocated, "
-                    f"{reserved:.2f}GB reserved"
-                )
-        
-        LOGGER.info("=" * 70)
-        LOGGER.info("✅ All models loaded successfully")
-        LOGGER.info("=" * 70)
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            LOGGER.info(f"   💾 GPU 3: {allocated:.2f}GB allocated")
+    
     
     def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
         """预处理图像"""
@@ -207,21 +184,22 @@ class OfficialDINOv3Pipeline:
     
     @torch.inference_mode()
     def run_detection(
-        self,
-        image: np.ndarray,
-    ) -> Dict[str, Any]:
+    self,
+    image: np.ndarray,
+) -> Dict[str, Any]:
         """运行检测"""
         LOGGER.info("🎯 Running detection...")
         
-        # 预处理
-        batch_img = self._preprocess_image(image).to(self.device)
+        # 按需加载检测器
+        self._load_detector_if_needed()
+        
+        # 预处理并移到GPU 0
+        batch_img = self._preprocess_image(image).to("cuda:0")
         
         # 推理
-        with torch.autocast('cuda', dtype=self.dtype):
-            predictions = self.detector(batch_img)
+        predictions = self.detector(batch_img)
         
         # 解析结果
-        # DINOv3 detector返回格式：[{'boxes': ..., 'scores': ..., 'labels': ...}]
         pred = predictions[0] if isinstance(predictions, list) else predictions
         
         boxes = pred['boxes'].cpu().numpy()
@@ -244,11 +222,14 @@ class OfficialDINOv3Pipeline:
     
     @torch.inference_mode()
     def run_segmentation(
-        self,
-        image: np.ndarray,
-    ) -> Dict[str, Any]:
+    self,
+    image: np.ndarray,
+) -> Dict[str, Any]:
         """运行分割"""
         LOGGER.info("🖼️  Running segmentation...")
+        
+        # 按需加载分割器
+        self._load_segmentor_if_needed()
         
         # 导入分割推理工具
         from dinov3.eval.segmentation.inference import make_inference
@@ -261,30 +242,29 @@ class OfficialDINOv3Pipeline:
         pil_image = Image.fromarray(image) if isinstance(image, np.ndarray) else image
         original_size = pil_image.size  # (W, H)
         
-        batch_img = self._preprocess_image(image).to(self.device)
+        # 移到GPU 0
+        batch_img = self._preprocess_image(image).to("cuda:0")
         
-        # 滑窗推理（处理大分辨率图像）
-        with torch.autocast('cuda', dtype=self.dtype):
-            segmentation_map = make_inference(
-                batch_img,
-                self.segmentor,
-                inference_mode=seg_cfg.get('inference_mode', 'slide'),
-                decoder_head_type=seg_cfg.get('decoder_head_type', 'm2f'),
-                rescale_to=original_size,
-                n_output_channels=seg_cfg['num_classes'],
-                crop_size=tuple(inf_cfg['crop_size']),
-                stride=tuple(inf_cfg['stride']),
-                output_activation=partial(torch.nn.functional.softmax, dim=1),
-            )
+        # 滑窗推理
+        segmentation_map = make_inference(
+            batch_img,
+            self.segmentor,
+            inference_mode=seg_cfg.get('inference_mode', 'slide'),
+            decoder_head_type=seg_cfg.get('decoder_head_type', 'm2f'),
+            rescale_to=original_size,
+            n_output_channels=seg_cfg['num_classes'],
+            crop_size=tuple(inf_cfg['crop_size']),
+            stride=tuple(inf_cfg['stride']),
+            output_activation=partial(torch.nn.functional.softmax, dim=1),
+        )
         
         # 转换为numpy
-        # segmentation_map: [B, C, H, W]
-        probs = segmentation_map[0].cpu().numpy()  # [C, H, W]
-        class_map = segmentation_map.argmax(dim=1, keepdim=False)[0].cpu().numpy()  # [H, W]
+        probs = segmentation_map[0].cpu().numpy()
+        class_map = segmentation_map.argmax(dim=1, keepdim=False)[0].cpu().numpy()
         
         result = {
-            'probs': probs,  # [C, H, W] 概率图
-            'class_map': class_map,  # [H, W] 类别索引
+            'probs': probs,
+            'class_map': class_map,
             'num_classes': seg_cfg['num_classes'],
         }
         

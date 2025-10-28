@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'  # 添加这一行
+
 """
 使用官方DINOv3代码的测试脚本
 支持ViT-7B/16 + 多GPU模型并行
