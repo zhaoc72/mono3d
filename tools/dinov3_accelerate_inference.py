@@ -144,23 +144,23 @@ def resolve_tasks(task: str) -> Tuple[bool, bool]:
     raise ValueError(f"未知 task: {task}")
 
 
-def build_max_memory(arg: Optional[str]) -> Optional[Dict[str, str]]:
+def build_max_memory(arg: Optional[str]) -> Optional[Dict[int, str]]:
     if arg is None:
         if not torch.cuda.is_available():
             return None
-        memory: Dict[str, str] = {}
+        memory: Dict[int, str] = {}
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)
             total_gb = props.total_memory // (1024**3)
             usable = max(total_gb - 2, 1)
-            memory[f"cuda:{index}"] = f"{usable}GiB"
+            memory[index] = f"{usable}GiB"
         return memory
 
     normalized = arg.strip().lower()
     if normalized.endswith("gib"):
         normalized = normalized[:-3]
     value = float(normalized)
-    memory = {f"cuda:{idx}": f"{value}GiB" for idx in range(torch.cuda.device_count())}
+    memory = {idx: f"{value}GiB" for idx in range(torch.cuda.device_count())}
     return memory
 
 
@@ -168,7 +168,7 @@ def prepare_device_map(
     model: torch.nn.Module,
     *,
     device_map_option: str,
-    max_memory: Optional[Dict[str, str]],
+    max_memory: Optional[Dict[int, str]],
     no_split: Sequence[str],
 ) -> Tuple[Mapping[str, str] | str, Optional[str]]:
     if device_map_option != "auto":
