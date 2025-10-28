@@ -84,6 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Accelerate device_map 配置，默认 auto",
     )
     parser.add_argument(
+        "--visible-devices",
+        default=None,
+        help="显式设置 CUDA_VISIBLE_DEVICES，例如 0,1,2,3",
+    )
+    parser.add_argument(
+        "--min-gpus",
+        type=int,
+        default=4,
+        help="要求可见的最少 GPU 数，默认 4（四张 4090）",
+    )
+    parser.add_argument(
         "--max-memory",
         default=None,
         help="每张 GPU 的最大可用显存（GiB）。例如 22 或 22GiB，默认自动推断",
@@ -146,12 +157,6 @@ def resolve_tasks(task: str) -> Tuple[bool, bool]:
     raise ValueError(f"未知 task: {task}")
 
 
-def _cuda_device_keys() -> List[str]:
-    if not torch.cuda.is_available():
-        return []
-    return [f"cuda:{idx}" for idx in range(torch.cuda.device_count())]
-
-
 def _normalize_memory_value(raw: str) -> str:
     value = raw.strip()
     if not value:
@@ -174,6 +179,33 @@ def _device_key_to_index(device_key: str) -> int:
     return int(key)
 
 
+def apply_visible_devices(spec: Optional[str]) -> None:
+    if spec is None:
+        return
+    value = spec.strip()
+    if not value:
+        raise ValueError("--visible-devices 不能为空字符串")
+    os.environ["CUDA_VISIBLE_DEVICES"] = value
+    LOGGER.info("设置 CUDA_VISIBLE_DEVICES=%s", value)
+    # 触发一次设备查询，确保新的环境变量生效
+    if torch.cuda.is_available():
+        torch.cuda.device_count()
+
+
+def ensure_minimum_gpus(min_required: int) -> Sequence[int]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("未检测到可用的 CUDA 设备，请检查驱动与环境配置")
+    count = torch.cuda.device_count()
+    indices = list(range(count))
+    if min_required > 0 and count < min_required:
+        raise RuntimeError(
+            f"仅检测到 {count} 张 GPU，低于要求的 {min_required} 张，请检查 CUDA_VISIBLE_DEVICES 或驱动设置"
+        )
+    device_names = [torch.cuda.get_device_name(i) for i in indices]
+    LOGGER.info("当前可见 GPU：%s", ", ".join(f"{i}:{name}" for i, name in zip(indices, device_names)))
+    return indices
+
+
 def _normalize_max_memory_keys(mapping: Optional[Mapping[int | str, str]]) -> Optional[Dict[int, str]]:
     if mapping is None:
         return None
@@ -184,24 +216,13 @@ def _normalize_max_memory_keys(mapping: Optional[Mapping[int | str, str]]) -> Op
     return normalized or None
 
 
-def build_max_memory(arg: Optional[str]) -> Optional[Dict[int, str]]:
-    if not torch.cuda.is_available():
+def build_max_memory(arg: Optional[str], available_devices: Sequence[int]) -> Optional[Dict[int, str]]:
+    if not torch.cuda.is_available() or not available_devices:
         return None
-
-    devices = _cuda_device_keys()
-    if not devices:
-        return None
-
-    if len(devices) < 4:
-        LOGGER.warning(
-            "仅检测到 %d 张 GPU，若期望使用 4 张 4090 请确认 CUDA_VISIBLE_DEVICES 或驱动设置",
-            len(devices),
-        )
 
     if arg is None:
         memory: Dict[int, str] = {}
-        for device in devices:
-            idx = int(device.split(":")[-1])
+        for idx in available_devices:
             props = torch.cuda.get_device_properties(idx)
             total_gb = props.total_memory // (1024**3)
             usable = max(total_gb - 2, 1)
@@ -217,13 +238,16 @@ def build_max_memory(arg: Optional[str]) -> Optional[Dict[int, str]]:
                 raise ValueError("--max-memory 自定义映射需要使用 device:value 形式，例如 cuda:0:21GiB")
             device_key, raw_value = segment.rsplit(":", 1)
             device_index = _device_key_to_index(device_key)
+            if device_index not in available_devices:
+                raise ValueError(
+                    f"设备 {device_index} 不在当前可见 GPU 列表 {list(available_devices)} 中，请检查 --visible-devices"
+                )
             memory[device_index] = _normalize_memory_value(raw_value)
         return memory or None
 
     normalized_value = _normalize_memory_value(arg)
-    for device in devices:
-        device_index = int(device.split(":")[-1])
-        memory[device_index] = normalized_value
+    for idx in available_devices:
+        memory[idx] = normalized_value
     return memory
 
 
@@ -628,6 +652,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     configure_logging(args.log_level)
 
+<<<<<<< ours
+=======
+    apply_visible_devices(args.visible_devices)
+
+>>>>>>> theirs
     repo_path = resolve_path(args.repo)
     input_path = resolve_path(args.input)
     output_dir = resolve_path(args.output)
@@ -647,7 +676,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dtype = torch.float32
     LOGGER.info("推理统一使用 float32 精度")
 
+<<<<<<< ours
     max_memory = build_max_memory(args.max_memory)
+=======
+    available_devices: Sequence[int] = []
+    if args.device_map == "auto":
+        available_devices = ensure_minimum_gpus(args.min_gpus)
+    max_memory = build_max_memory(args.max_memory, available_devices)
+>>>>>>> theirs
 
     detection_model = None
     detection_device = None

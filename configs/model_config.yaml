@@ -55,6 +55,10 @@ pipelines:
           - "{output_dir}/detection"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
         env:
           DINOV3_TASK: detection
@@ -76,6 +80,10 @@ pipelines:
           - "{output_dir}/segmentation"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
           - --color-map
           - Spectral
@@ -101,6 +109,10 @@ pipelines:
           - "{output_dir}/joint"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
           - --color-map
           - Spectral

@@ -2,7 +2,7 @@
 
 本仓库提供一个统一的推理与重建编排框架，目标是在单目 3D 感知场景中整合多个视觉模块：
 
-- **DINOv3**：ViT-7B 主干，支持检测与语义分割 Adapter，并结合 Accelerate 自动在四张 4090 间切分；所有推理统一使用 float32；
+- **DINOv3**：ViT-7B 主干，支持检测与语义分割 Adapter，并结合 Accelerate 自动在四张 4090 间切分；默认要求可见 4 张 GPU（可通过 `--min-gpus` 调整）；所有推理统一使用 float32；
 - **SAM2**（规划中）：生成掩码与提示；
 - **3D Gaussian Splatting**（规划中）：完成重建与可视化。
 
@@ -86,6 +86,10 @@ pipelines:
           - "{output_dir}/detection"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
       - name: segmentation
         script: ../mono3d/tools/dinov3_accelerate_inference.py
@@ -104,6 +108,10 @@ pipelines:
           - "{output_dir}/segmentation"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
           - --color-map
           - Spectral
@@ -126,12 +134,16 @@ pipelines:
           - "{output_dir}/joint"
           - --device-map
           - auto
+          - --visible-devices
+          - 0,1,2,3
+          - --min-gpus
+          - "4"
           - --save-visuals
           - --color-map
           - Spectral
 ```
 
-如需调整显存占用，可通过 `--max-memory` 指定 GiB 限制，例如 `--max-memory 22`。脚本会调用 Accelerate 的 `infer_auto_device_map`，在四张 RTX 4090 间自动切分 ViT-7B 权重。
+如需调整显存占用，可通过 `--max-memory` 指定 GiB 限制，例如 `--max-memory 22`。脚本会调用 Accelerate 的 `infer_auto_device_map`，在四张 RTX 4090 间自动切分 ViT-7B 权重；若环境中仅暴露部分 GPU，可用 `--visible-devices` 手动指定 `CUDA_VISIBLE_DEVICES`，或通过 `--min-gpus` 调整最少 GPU 要求。
 
 每条流水线包含若干 `tasks`，对应需要执行的官方脚本；任务参数仍支持格式化模板，方便根据上下文拼接路径。
 
@@ -171,6 +183,8 @@ python tools/dinov3_accelerate_inference.py \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/detection \
   --device-map auto \
+  --visible-devices 0,1,2,3 \
+  --min-gpus 4 \
   --save-visuals
 
 # 2. 仅执行 DINOv3 语义分割（保存伪彩叠加图）
@@ -182,6 +196,8 @@ python tools/dinov3_accelerate_inference.py \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/segmentation \
   --device-map auto \
+  --visible-devices 0,1,2,3 \
+  --min-gpus 4 \
   --save-visuals \
   --color-map Spectral
 
@@ -195,6 +211,8 @@ python tools/dinov3_accelerate_inference.py \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/joint \
   --device-map auto \
+  --visible-devices 0,1,2,3 \
+  --min-gpus 4 \
   --save-visuals \
   --color-map Spectral
 ```
