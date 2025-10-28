@@ -146,23 +146,65 @@ def resolve_tasks(task: str) -> Tuple[bool, bool]:
     raise ValueError(f"未知 task: {task}")
 
 
-def build_max_memory(arg: Optional[str]) -> Optional[Dict[int, str]]:
+def _cuda_device_keys() -> List[str]:
+    if not torch.cuda.is_available():
+        return []
+    return [f"cuda:{idx}" for idx in range(torch.cuda.device_count())]
+
+
+def _normalize_memory_value(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("显存上限配置不能为空")
+    if value.lower().endswith("gib"):
+        value = value[:-3]
+    numeric = float(value)
+    return f"{numeric}GiB"
+
+
+def build_max_memory(arg: Optional[str]) -> Optional[Dict[str, str]]:
+    if not torch.cuda.is_available():
+        return None
+
+    devices = _cuda_device_keys()
+    if not devices:
+        return None
+
+    if len(devices) < 4:
+        LOGGER.warning(
+            "仅检测到 %d 张 GPU，若期望使用 4 张 4090 请确认 CUDA_VISIBLE_DEVICES 或驱动设置",
+            len(devices),
+        )
+
     if arg is None:
-        if not torch.cuda.is_available():
-            return None
-        memory: Dict[int, str] = {}
-        for index in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(index)
+        memory: Dict[str, str] = {}
+        for device in devices:
+            idx = int(device.split(":")[-1])
+            props = torch.cuda.get_device_properties(idx)
             total_gb = props.total_memory // (1024**3)
             usable = max(total_gb - 2, 1)
-            memory[index] = f"{usable}GiB"
+            memory[device] = f"{usable}GiB"
         return memory
 
-    normalized = arg.strip().lower()
-    if normalized.endswith("gib"):
-        normalized = normalized[:-3]
-    value = float(normalized)
-    memory = {idx: f"{value}GiB" for idx in range(torch.cuda.device_count())}
+    memory: Dict[str, str] = {}
+    if "," in arg:
+        for segment in arg.split(","):
+            if not segment.strip():
+                continue
+            if ":" not in segment:
+                raise ValueError("--max-memory 自定义映射需要使用 device:value 形式，例如 cuda:0:21GiB")
+            device_key, raw_value = segment.split(":", 1)
+            device_key = device_key.strip()
+            if not device_key:
+                raise ValueError("--max-memory 中的 device 不能为空")
+            if not device_key.startswith("cuda"):
+                device_key = f"cuda:{device_key}"
+            memory[device_key] = _normalize_memory_value(raw_value)
+        return memory or None
+
+    normalized_value = _normalize_memory_value(arg)
+    for device in devices:
+        memory[device] = normalized_value
     return memory
 
 
@@ -170,7 +212,7 @@ def prepare_device_map(
     model: torch.nn.Module,
     *,
     device_map_option: str,
-    max_memory: Optional[Dict[int, str]],
+    max_memory: Optional[Dict[str, str]],
     no_split: Sequence[str],
 ) -> Tuple[Mapping[str, str] | str, Optional[str]]:
     if device_map_option != "auto":
@@ -181,13 +223,29 @@ def prepare_device_map(
         LOGGER.warning("未检测到 CUDA，device_map=auto 将退化为 CPU 推理")
         return "cpu", None
 
-    from accelerate.utils import infer_auto_device_map
+    from accelerate.utils import get_balanced_memory, infer_auto_device_map
 
     LOGGER.info("根据显存推断 device_map (max_memory=%s)", max_memory)
+    dtype = next((param.dtype for param in model.parameters()), torch.float32)
+
+    balanced: Optional[Mapping[str, str]] = None
+    try:
+        balanced = get_balanced_memory(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=list(no_split),
+            dtype=dtype,
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        LOGGER.debug("get_balanced_memory 失败，将直接使用用户提供的 max_memory: %s", exc)
+
+    max_memory_for_infer = balanced or max_memory
+
     device_map = infer_auto_device_map(
         model,
-        max_memory=max_memory,
+        max_memory=max_memory_for_infer,
         no_split_module_classes=list(no_split),
+        dtype=dtype,
     )
 
     if isinstance(device_map, Mapping):
@@ -226,7 +284,11 @@ def prepare_device_map(
         if dropped:
             LOGGER.debug("device_map 条目被丢弃（未找到模块）: %s", dropped)
 
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("归一化前 device_map 条目数：%d", len(device_map))
         device_map = normalized
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("归一化后 device_map 条目数：%d", len(device_map))
 
     primary = next((device for device in device_map.values() if device != "cpu"), "cpu")
     LOGGER.info("推断得到 primary device: %s", primary)
