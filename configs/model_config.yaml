@@ -1,120 +1,65 @@
-# DINOv3 配置文件（修复版 - 适配器随机初始化）
-# 解决架构不匹配问题
+# DINOv3 官方代码配置 (ViT-7B/16 + 多GPU支持)
 
 model:
-  name: "dinov3_adapter"
+  name: "dinov3_official"
   
   # ============================================
-  # DINOv3 Backbone 配置
+  # DINOv3 Official 配置
   # ============================================
-  backbone:
-    type: "dinov3"
+  dinov3_official:
+    # 官方代码路径
+    repo_dir: "/media/pc/D/zhaochen/mono3d/dinov3"
     
-    # Model paths
-    repo_path: "/media/pc/D/zhaochen/mono3d/dinov3"
-    model_name: "dinov3_vit7b16"
-    checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_lvd1689m.pth"
+    # Backbone 配置
+    backbone:
+      model_name: "dinov3_vit7b16"
+      checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_lvd1689m.pth"
     
-    # Model architecture
-    patch_size: 16
-    embed_dim: 4096
-    num_heads: 32
-    num_layers: 40
-    image_size: 518
+    # Detection 配置
+    detection:
+      model_name: "dinov3_vit7b16_de"  # COCO detector
+      checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth"
+      score_threshold: 0.1
     
-    # Training settings
-    freeze: true
+    # Segmentation 配置
+    segmentation:
+      model_name: "dinov3_vit7b16_ms"  # ADE20K segmentor
+      checkpoint_path: "/media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth"
+      num_classes: 150
+      inference_mode: "slide"  # 滑窗推理
+      decoder_head_type: "m2f"  # Mask2Former
     
-    # Memory optimization settings
-    memory_efficient_attention: true
-    gradient_checkpointing: false
-    cpu_offload: false
-    load_in_8bit: false
+    # 多GPU配置
+    multi_gpu:
+      enabled: true
+      num_gpus: 4
+      device_ids: [0, 1, 2, 3]
+      # 模型并行策略：将大模型拆分到多张卡
+      strategy: "model_parallel"  # model_parallel 或 data_parallel
+      
+      # 显存分配 (每张卡预留的显存)
+      max_memory:
+        0: "18GiB"
+        1: "18GiB"
+        2: "18GiB"
+        3: "18GiB"
+        cpu: "100GiB"
     
-    # Feature extraction settings
-    output_layers: [9, 19, 29, 39]
-    layer_weights: [1.0, 1.0, 1.0, 1.0]
-    fusion_method: "weighted_sum"
-    
-    # PCA and objectness
-    enable_objectness: true
-    enable_pca: false
-    pca_dim: 64
-    
-    # Positional features
-    append_positional_features: true
-    positional_feature_scale: 1.0
-    
-    # Objectness post-processing
-    objectness_smoothing_kernel: 5
-    objectness_contrast_gamma: 2.0
-    
-    # Device settings
-    dtype: "float16"
-    device: "cuda"
-  
-  # ============================================
-  # Detection Adapter 配置（随机初始化）
-  # ============================================
-  detection_adapter:
-    type: "detr_head"
-    
-    # 🔥 关键修复：不加载预训练权重
-    checkpoint_path: ""
-    
-    freeze: false
-    
-    # 🔥 关键修复：匹配 ViT-7B 特征维度
-    feature_dim: 4096  # 从 3200 改为 4096
-    num_classes: 91
-    
-    # DETR 架构
-    hidden_dim: 256
-    num_queries: 300
-    nheads: 8
-    num_encoder_layers: 6
-    num_decoder_layers: 6
-    dim_feedforward: 2048
-    dropout: 0.1
-    
-    # 🔥 关键修复：提高阈值（随机权重的分数更分散）
-    score_threshold: 0.3  # 从 0.05 提高到 0.3
-    aux_loss: true
-    use_objectness: true
-  
-  # ============================================
-  # Segmentation Adapter 配置（随机初始化）
-  # ============================================
-  segmentation_adapter:
-    type: "mask_head"
-    
-    # 🔥 关键修复：不加载预训练权重
-    checkpoint_path: ""
-    
-    freeze: false
-    
-    # 🔥 关键修复：匹配 ViT-7B 特征维度
-    feature_dim: 4096  # 从 3200 改为 4096
-    num_classes: 150
-    
-    # Mask 解码器
-    hidden_dim: 256
-    num_mask_tokens: 100
-    mask_dim: 256
-    
-    # FPN 配置
-    use_fpn: true
-    fpn_scales: [8, 16, 32]
+    # 推理配置
+    inference:
+      image_size: 896  # 推理分辨率
+      dtype: "bfloat16"  # bfloat16 或 float16
+      crop_size: [896, 896]
+      stride: [896, 896]
 
 # ============================================
-# Fusion 配置（提高阈值）
+# Fusion 配置
 # ============================================
 fusion:
-  # 🔥 关键修复：提高阈值，更依赖 objectness
-  objectness_threshold: 0.5      # 从 0.45 提高到 0.5
-  segmentation_threshold: 0.4    # 从 0.35 提高到 0.4
-  detection_score_threshold: 0.3 # 从 0.05 提高到 0.3
-  min_instance_area: 100         # 从 60 提高到 100
+  objectness_threshold: 0.4
+  segmentation_threshold: 0.3
+  detection_score_threshold: 0.05
+  min_instance_area: 100
   dilation_kernel: 3
   nms_iou_threshold: 0.6
 
@@ -126,10 +71,9 @@ prompts:
   include_boxes: true
   include_masks: true
   max_points_per_region: 3
-  grid_points_per_side: 0
-  min_score: 0.2                 # 从 0.0 提高到 0.2
-  max_prompts: 50                # 从 128 降低到 50
-  max_prompts_per_class: 5       # 从 0 改为 5（限制每类最多5个）
+  min_score: 0.1
+  max_prompts: 50
+  max_prompts_per_class: 5
   nms_iou_threshold: 0.5
 
 # ============================================
@@ -137,8 +81,7 @@ prompts:
 # ============================================
 instance_grouping:
   method: "connected_components"
-  min_area: 100                  # 从 60 提高到 100
-  use_density_clustering: false
+  min_area: 100
 
 # ============================================
 # 后处理配置
@@ -147,7 +90,7 @@ postprocess:
   enable: true
   closing_kernel: 5
   opening_kernel: 3
-  min_instance_area: 100         # 从 60 提高到 100
+  min_instance_area: 100
 
 # ============================================
 # SAM2 配置
@@ -157,46 +100,5 @@ sam2:
   checkpoint_path: "/media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2.1_hiera_large.pt"
   model_config: "sam2.1/sam2.1_hiera_l"
   max_batch_size: 32
-  
-  # Mask 选择策略
   mask_selection_strategy: "best_balanced"
   multimask_output: true
-
-# ============================================
-# 推理配置
-# ============================================
-inference:
-  device: "cuda"
-  dtype: "float32"
-  batch_size: 1
-  
-  # 图像预处理
-  image_size: [518, 518]
-  normalize:
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
-
-# ============================================
-# 配置说明
-# ============================================
-# 
-# 本配置采用"随机初始化适配器"方案，理由：
-# 
-# 1. 官方预训练权重架构不匹配：
-#    - 官方：Deformable DETR (768维hidden, 多层变形注意力)
-#    - 简化版：SimpleDETR (256维hidden, 单层编码器)
-# 
-# 2. 管道设计哲学：
-#    - DINOv3 提供高质量语义特征（已预训练）
-#    - 适配器生成粗糙候选区域（随机初始化可接受）
-#    - SAM2 进行精细分割（最终质量保证）
-# 
-# 3. 关键参数调整：
-#    - feature_dim: 4096（匹配ViT-7B）
-#    - 阈值提高（补偿随机权重的不确定性）
-#    - 更依赖objectness map（DINOv3的强项）
-# 
-# 4. 预期效果：
-#    - 检测框：5-20个高质量候选
-#    - 分割：粗糙但合理的前景区域
-#    - SAM2：精细化为高质量实例mask
