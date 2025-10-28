@@ -352,6 +352,18 @@ def annotate_detections(
     return annotated
 
 
+def get_module_dtype(module) -> torch.dtype:
+    """Try to read the dtype from a hub predictor or plain nn.Module."""
+
+    if isinstance(module, torch.nn.Module):
+        for parameter in module.parameters():
+            return parameter.dtype
+    if hasattr(module, "model") and isinstance(module.model, torch.nn.Module):
+        for parameter in module.model.parameters():
+            return parameter.dtype
+    return torch.float32
+
+
 def run_detection_inference(
     predictor,
     images: Iterable[Path],
@@ -378,9 +390,12 @@ def run_detection_inference(
                 raise
 
             LOGGER.debug("Detectron2 numpy 输入失败，回退为 tensor batch：%s", message)
-            tensor = torch.as_tensor(bgr_image.astype("float32").transpose(2, 0, 1))
+            tensor = torch.from_numpy(bgr_image).permute(2, 0, 1).contiguous()
+            model_dtype = get_module_dtype(predictor)
+            target_dtype = model_dtype if model_dtype.is_floating_point else torch.float32
+            tensor = tensor.to(dtype=target_dtype)
             if device is not None:
-                tensor = tensor.to(device)
+                tensor = tensor.to(device=device, dtype=target_dtype)
             outputs = predictor([tensor])
         instances = outputs["instances"].to("cpu")
         boxes = instances.pred_boxes.tensor.numpy().tolist()
