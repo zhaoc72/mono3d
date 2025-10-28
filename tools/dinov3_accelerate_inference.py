@@ -361,6 +361,16 @@ def dispatch_model_if_needed(
         module = hub_model.model
         attribute_owner = hub_model
 
+    # Torch Hub 加载后的模型常驻在第一张 GPU 上，若不提前迁移回 CPU，dispatch_model
+    # 在处理第一批参数时会立即触发 OOM。这里显式地将模块同步到 CPU，再交由
+    # Accelerate 按照 device_map 切分迁移，确保多卡显存都可被利用。
+    if next(module.parameters(), None) is not None:
+        current_device = next(module.parameters()).device
+        if current_device.type == "cuda":
+            LOGGER.debug("dispatch_model 前将模块从 %s 迁移到 CPU", current_device)
+            module.to("cpu")
+            torch.cuda.empty_cache()
+
     LOGGER.info("使用 Accelerate dispatch_model 进行模型分片")
     sharded = dispatch_model(module, device_map=device_map)
     if attribute_owner is not None:
