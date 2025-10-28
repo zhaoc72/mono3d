@@ -358,6 +358,7 @@ def run_detection_inference(
     output_dir: Path,
     *,
     save_visuals: bool,
+    device: Optional[str],
 ) -> None:
     import numpy as np
 
@@ -369,7 +370,18 @@ def run_detection_inference(
         image = Image.open(image_path).convert("RGB")
         # detectron2 期望 BGR
         bgr_image = np.array(image)[:, :, ::-1]
-        outputs = predictor(bgr_image)
+        try:
+            outputs = predictor(bgr_image)
+        except ValueError as exc:
+            message = str(exc)
+            if "not supported" not in message.lower():
+                raise
+
+            LOGGER.debug("Detectron2 numpy 输入失败，回退为 tensor batch：%s", message)
+            tensor = torch.as_tensor(bgr_image.astype("float32").transpose(2, 0, 1))
+            if device is not None:
+                tensor = tensor.to(device)
+            outputs = predictor([tensor])
         instances = outputs["instances"].to("cpu")
         boxes = instances.pred_boxes.tensor.numpy().tolist()
         scores = instances.scores.numpy().tolist()
@@ -498,6 +510,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     max_memory = build_max_memory(args.max_memory)
 
     detection_model = None
+    detection_device = None
     segmentation_model = None
     segmentation_device = None
 
@@ -522,8 +535,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_memory=max_memory,
             no_split=args.no_split,
         )
-        dispatch_model_if_needed(detection_model, device_map=device_map_det)
-        LOGGER.info("检测模型主设备：%s", primary_det or get_primary_device(device_map_det))
+        _, dispatch_primary_det = dispatch_model_if_needed(detection_model, device_map=device_map_det)
+        detection_device = primary_det or dispatch_primary_det or get_primary_device(device_map_det)
+        LOGGER.info("检测模型主设备：%s", detection_device)
 
     if need_segmentation:
         LOGGER.info("通过 torch.hub 加载分割模型")
@@ -556,6 +570,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             images,
             output_dir / "detection" if need_segmentation else output_dir,
             save_visuals=args.save_visuals,
+            device=detection_device,
         )
 
     if segmentation_model is not None and segmentation_device is not None:
