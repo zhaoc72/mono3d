@@ -38,9 +38,9 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -251,6 +251,43 @@ def build_max_memory(arg: Optional[str], available_devices: Sequence[int]) -> Op
     return memory
 
 
+@contextmanager
+def temporarily_disable_cuda_for_hub() -> Iterator[bool]:
+    """Temporarily mask CUDA so torch.hub 初始化不会把模型放到 GPU 上."""
+
+    if not torch.cuda.is_available():
+        yield False
+        return
+
+    original_is_available = torch.cuda.is_available
+    original_device_count = torch.cuda.device_count
+    visible_backup = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    def _false() -> bool:  # pragma: no cover - simple wrapper
+        return False
+
+    def _zero() -> int:  # pragma: no cover - simple wrapper
+        return 0
+
+    torch.cuda.is_available = _false  # type: ignore[assignment]
+    torch.cuda.device_count = _zero  # type: ignore[assignment]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+    try:
+        yield True
+    finally:
+        torch.cuda.is_available = original_is_available  # type: ignore[assignment]
+        torch.cuda.device_count = original_device_count  # type: ignore[assignment]
+        if visible_backup is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible_backup
+        try:
+            torch.cuda.device_count()
+        except Exception:  # pragma: no cover - driver issues fallback
+            pass
+
+
 def _ensure_module_on_device(obj, device: str) -> bool:
     """尽量将 hub 返回对象上的模块移动到指定设备。"""
 
@@ -287,11 +324,15 @@ def load_torch_hub_model(repo: Path, entrypoint: str, **kwargs):
     load_kwargs.setdefault("source", "local")
     load_kwargs.setdefault("map_location", "cpu")
 
-    try:
-        model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
-    except TypeError:
-        load_kwargs.pop("map_location", None)
-        model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
+    with temporarily_disable_cuda_for_hub() as disabled:
+        try:
+            model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("map_location", None)
+            model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
+
+    if disabled and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     _ensure_module_on_device(model, "cpu")
     return model
