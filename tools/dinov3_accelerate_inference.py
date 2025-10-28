@@ -162,7 +162,29 @@ def _normalize_memory_value(raw: str) -> str:
     return f"{numeric}GiB"
 
 
-def build_max_memory(arg: Optional[str]) -> Optional[Dict[str, str]]:
+def _device_key_to_index(device_key: str) -> int:
+    key = device_key.strip()
+    if not key:
+        raise ValueError("显卡编号不能为空")
+    if key.startswith("cuda"):
+        parts = key.split(":")
+        if len(parts) == 1:
+            raise ValueError(f"无法从 {device_key!r} 推断出显卡编号")
+        key = parts[-1]
+    return int(key)
+
+
+def _normalize_max_memory_keys(mapping: Optional[Mapping[int | str, str]]) -> Optional[Dict[int, str]]:
+    if mapping is None:
+        return None
+    normalized: Dict[int, str] = {}
+    for key, value in mapping.items():
+        idx = _device_key_to_index(str(key))
+        normalized[idx] = value
+    return normalized or None
+
+
+def build_max_memory(arg: Optional[str]) -> Optional[Dict[int, str]]:
     if not torch.cuda.is_available():
         return None
 
@@ -177,34 +199,31 @@ def build_max_memory(arg: Optional[str]) -> Optional[Dict[str, str]]:
         )
 
     if arg is None:
-        memory: Dict[str, str] = {}
+        memory: Dict[int, str] = {}
         for device in devices:
             idx = int(device.split(":")[-1])
             props = torch.cuda.get_device_properties(idx)
             total_gb = props.total_memory // (1024**3)
             usable = max(total_gb - 2, 1)
-            memory[device] = f"{usable}GiB"
+            memory[idx] = f"{usable}GiB"
         return memory
 
-    memory: Dict[str, str] = {}
+    memory: Dict[int, str] = {}
     if "," in arg:
         for segment in arg.split(","):
             if not segment.strip():
                 continue
             if ":" not in segment:
                 raise ValueError("--max-memory 自定义映射需要使用 device:value 形式，例如 cuda:0:21GiB")
-            device_key, raw_value = segment.split(":", 1)
-            device_key = device_key.strip()
-            if not device_key:
-                raise ValueError("--max-memory 中的 device 不能为空")
-            if not device_key.startswith("cuda"):
-                device_key = f"cuda:{device_key}"
-            memory[device_key] = _normalize_memory_value(raw_value)
+            device_key, raw_value = segment.rsplit(":", 1)
+            device_index = _device_key_to_index(device_key)
+            memory[device_index] = _normalize_memory_value(raw_value)
         return memory or None
 
     normalized_value = _normalize_memory_value(arg)
     for device in devices:
-        memory[device] = normalized_value
+        device_index = int(device.split(":")[-1])
+        memory[device_index] = normalized_value
     return memory
 
 
@@ -212,7 +231,7 @@ def prepare_device_map(
     model: torch.nn.Module,
     *,
     device_map_option: str,
-    max_memory: Optional[Dict[str, str]],
+    max_memory: Optional[Dict[int, str]],
     no_split: Sequence[str],
 ) -> Tuple[Mapping[str, str] | str, Optional[str]]:
     if device_map_option != "auto":
@@ -225,21 +244,22 @@ def prepare_device_map(
 
     from accelerate.utils import get_balanced_memory, infer_auto_device_map
 
-    LOGGER.info("根据显存推断 device_map (max_memory=%s)", max_memory)
+    normalized_max_memory = _normalize_max_memory_keys(max_memory)
+    LOGGER.info("根据显存推断 device_map (max_memory=%s)", normalized_max_memory)
     dtype = next((param.dtype for param in model.parameters()), torch.float32)
 
     balanced: Optional[Mapping[str, str]] = None
     try:
         balanced = get_balanced_memory(
             model,
-            max_memory=max_memory,
+            max_memory=normalized_max_memory,
             no_split_module_classes=list(no_split),
             dtype=dtype,
         )
     except Exception as exc:  # pragma: no cover - diagnostics only
         LOGGER.debug("get_balanced_memory 失败，将直接使用用户提供的 max_memory: %s", exc)
 
-    max_memory_for_infer = balanced or max_memory
+    max_memory_for_infer = _normalize_max_memory_keys(balanced) or normalized_max_memory
 
     device_map = infer_auto_device_map(
         model,
