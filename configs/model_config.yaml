@@ -1,0 +1,130 @@
+project:
+  name: Mono3D 多流水线示例
+  description: >-
+    使用 DINOv3 作为视觉主干，后续可扩展到 SAM2 与 3D Gaussian Splatting 重建。
+
+context:
+  input_path: /media/pc/D/datasets/coco2017/train2017/000000000532.jpg
+  output_dir: /media/pc/D/zhaochen/mono3d/outputs
+
+execution:
+  python: python
+  accelerate:
+    command: accelerate
+    config: null
+    args:
+      - --mixed_precision
+      - fp16
+
+environment:
+  TORCH_DISTRIBUTED_DEBUG: DETAIL
+
+pipelines:
+  - name: dinov3
+    type: dinov3
+    enabled: true
+    description: DINOv3 ViT-7B 检测与语义分割推理
+    repo_path: ../dinov3
+    environment:
+      PYTHONPATH: "{repo_path}:{PYTHONPATH}"
+    context:
+      backbone_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_lvd1689m.pth
+      detection_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth
+      segmentation_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth
+      input_path: "{input_path}"
+      output_dir: "{output_dir}"
+    accelerate_args:
+      - --dynamo_backend
+      - no
+    tasks:
+      - name: detection
+        comment: "使用 Accelerate 自动切分在四卡上执行 DINOv3 检测"
+        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        args:
+          - --repo
+          - "{repo_path}"
+          - --task
+          - detection
+          - --backbone
+          - "{backbone_checkpoint}"
+          - --detection-adapter
+          - "{detection_checkpoint}"
+          - --input
+          - "{input_path}"
+          - --output
+          - "{output_dir}/detection"
+          - --device-map
+          - auto
+          - --save-visuals
+        env:
+          DINOV3_TASK: detection
+      - name: segmentation
+        comment: "使用 Accelerate 自动切分在四卡上执行 DINOv3 语义分割"
+        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        args:
+          - --repo
+          - "{repo_path}"
+          - --task
+          - segmentation
+          - --backbone
+          - "{backbone_checkpoint}"
+          - --segmentation-adapter
+          - "{segmentation_checkpoint}"
+          - --input
+          - "{input_path}"
+          - --output
+          - "{output_dir}/segmentation"
+          - --device-map
+          - auto
+          - --save-visuals
+          - --color-map
+          - Spectral
+        env:
+          DINOV3_TASK: segmentation
+      - name: detection+segmentation
+        comment: "单次运行同时完成检测与语义分割，并保存所有可视化结果"
+        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        args:
+          - --repo
+          - "{repo_path}"
+          - --task
+          - both
+          - --backbone
+          - "{backbone_checkpoint}"
+          - --detection-adapter
+          - "{detection_checkpoint}"
+          - --segmentation-adapter
+          - "{segmentation_checkpoint}"
+          - --input
+          - "{input_path}"
+          - --output
+          - "{output_dir}/joint"
+          - --device-map
+          - auto
+          - --save-visuals
+          - --color-map
+          - Spectral
+        env:
+          DINOV3_TASK: detection+segmentation
+  - name: sam2
+    type: sam2
+    enabled: false
+    description: SAM2 掩码生成（占位配置，待实现）
+    repo_path: ../sam2
+    environment:
+      PYTHONPATH: "{repo_path}:{PYTHONPATH}"
+    context:
+      model_checkpoint: /media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2_model.pth
+      prompt_dir: /media/pc/D/zhaochen/mono3d/prompts
+    tasks: []
+  - name: reconstruction
+    type: gaussian_splatting
+    enabled: false
+    description: 3D Gaussian Splatting 重建（占位配置，待实现）
+    repo_path: ../3dgs
+    environment:
+      PYTHONPATH: "{repo_path}:{PYTHONPATH}"
+    context:
+      point_cloud_dir: /media/pc/D/zhaochen/mono3d/gaussians/points
+      output_scene: /media/pc/D/zhaochen/mono3d/gaussians/scene
+    tasks: []
