@@ -251,6 +251,52 @@ def build_max_memory(arg: Optional[str], available_devices: Sequence[int]) -> Op
     return memory
 
 
+def _ensure_module_on_device(obj, device: str) -> bool:
+    """尽量将 hub 返回对象上的模块移动到指定设备。"""
+
+    moved = False
+    visited: set[int] = set()
+
+    def _move(module: torch.nn.Module) -> None:
+        nonlocal moved
+        ident = id(module)
+        if ident in visited:
+            return
+        visited.add(ident)
+        module.to(device)
+        moved = True
+
+    if isinstance(obj, torch.nn.Module):
+        _move(obj)
+
+    for attr in ("model", "detector", "segmentor", "backbone", "net", "module"):
+        if hasattr(obj, attr):
+            candidate = getattr(obj, attr)
+            if isinstance(candidate, torch.nn.Module):
+                _move(candidate)
+
+    if moved and device == "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return moved
+
+
+def load_torch_hub_model(repo: Path, entrypoint: str, **kwargs):
+    """加载 torch.hub 模型，优先在 CPU 上初始化以避免占满首张 GPU。"""
+
+    load_kwargs = dict(kwargs)
+    load_kwargs.setdefault("source", "local")
+    load_kwargs.setdefault("map_location", "cpu")
+
+    try:
+        model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop("map_location", None)
+        model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
+
+    _ensure_module_on_device(model, "cpu")
+    return model
+
+
 def prepare_device_map(
     model: torch.nn.Module,
     *,
@@ -695,10 +741,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if need_detection:
         LOGGER.info("通过 torch.hub 加载检测模型")
-        detection_model = torch.hub.load(
-            str(repo_path),
+        detection_model = load_torch_hub_model(
+            repo_path,
             "dinov3_vit7b16_de",
-            source="local",
             weights=args.detection_adapter,
             backbone_weights=args.backbone,
         )
@@ -720,10 +765,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if need_segmentation:
         LOGGER.info("通过 torch.hub 加载分割模型")
-        segmentation_model = torch.hub.load(
-            str(repo_path),
+        segmentation_model = load_torch_hub_model(
+            repo_path,
             "dinov3_vit7b16_ms",
-            source="local",
             weights=args.segmentation_adapter,
             backbone_weights=args.backbone,
         )
