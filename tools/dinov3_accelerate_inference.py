@@ -652,11 +652,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     configure_logging(args.log_level)
 
-<<<<<<< ours
-=======
     apply_visible_devices(args.visible_devices)
 
->>>>>>> theirs
     repo_path = resolve_path(args.repo)
     input_path = resolve_path(args.input)
     output_dir = resolve_path(args.output)
@@ -676,14 +673,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dtype = torch.float32
     LOGGER.info("推理统一使用 float32 精度")
 
-<<<<<<< ours
-    max_memory = build_max_memory(args.max_memory)
-=======
     available_devices: Sequence[int] = []
     if args.device_map == "auto":
         available_devices = ensure_minimum_gpus(args.min_gpus)
     max_memory = build_max_memory(args.max_memory, available_devices)
->>>>>>> theirs
 
     detection_model = None
     detection_device = None
