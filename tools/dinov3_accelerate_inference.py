@@ -37,6 +37,7 @@ import argparse
 import json
 import logging
 import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -188,6 +189,44 @@ def prepare_device_map(
         max_memory=max_memory,
         no_split_module_classes=list(no_split),
     )
+
+    if isinstance(device_map, Mapping):
+        module_names = {name for name, _ in model.named_modules()}
+        if "" not in module_names:
+            module_names.add("")
+        normalized: "OrderedDict[str, str]" = OrderedDict()
+        remapped = []
+        dropped = []
+        for name, target in device_map.items():
+            if name in module_names:
+                normalized[name] = target
+                continue
+            ancestor = name
+            matched = False
+            while "." in ancestor:
+                ancestor = ancestor.rsplit(".", 1)[0]
+                if ancestor in module_names:
+                    normalized[ancestor] = target
+                    remapped.append((name, ancestor))
+                    matched = True
+                    break
+            if not matched:
+                dropped.append(name)
+
+        if not normalized:
+            # 若所有条目均未匹配，则回退为整体单设备执行
+            fallback_device = next(iter(device_map.values()))
+            normalized[""] = fallback_device
+            LOGGER.warning(
+                "device_map 归一化后为空，回退为整模型设备: %s", fallback_device
+            )
+
+        if remapped:
+            LOGGER.debug("device_map 条目回退到父模块: %s", remapped)
+        if dropped:
+            LOGGER.debug("device_map 条目被丢弃（未找到模块）: %s", dropped)
+
+        device_map = normalized
 
     primary = next((device for device in device_map.values() if device != "cpu"), "cpu")
     LOGGER.info("推断得到 primary device: %s", primary)
