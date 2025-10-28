@@ -380,8 +380,8 @@ def run_detection_inference(
     for image_path in images:
         LOGGER.info("[detection] 处理 %s", image_path.name)
         image = Image.open(image_path).convert("RGB")
-        # detectron2 期望 BGR
-        bgr_image = np.array(image)[:, :, ::-1]
+        # detectron2 期望 BGR，确保数组为连续内存防止负 stride
+        bgr_image = np.array(image)[:, :, ::-1].copy()
         try:
             outputs = predictor(bgr_image)
         except ValueError as exc:
