@@ -14,7 +14,7 @@ execution:
     config: null
     args:
       - --mixed_precision
-      - fp16
+      - no
 
 environment:
   TORCH_DISTRIBUTED_DEBUG: DETAIL

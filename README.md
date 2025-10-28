@@ -2,7 +2,7 @@
 
 本仓库提供一个统一的推理与重建编排框架，目标是在单目 3D 感知场景中整合多个视觉模块：
 
-- **DINOv3**：ViT-7B 主干，支持检测与语义分割 Adapter，并结合 Accelerate 自动在四张 4090 间切分；所有推理统一使用 float16；
+- **DINOv3**：ViT-7B 主干，支持检测与语义分割 Adapter，并结合 Accelerate 自动在四张 4090 间切分；所有推理统一使用 float32；
 - **SAM2**（规划中）：生成掩码与提示；
 - **3D Gaussian Splatting**（规划中）：完成重建与可视化。
 

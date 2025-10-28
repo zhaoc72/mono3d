@@ -6,7 +6,7 @@
 * 通过 ``torch.hub`` 加载官方 backbone + detection/segmentation adapter；
 * 基于 Accelerate ``infer_auto_device_map`` 推理模型的模块切分方案；
 * 将模型参数分发到多卡（默认 `device_map="auto"`）；
-* 统一使用 float16 精度执行检测、语义分割，或一次同时完成二者；
+* 统一使用 float32 精度执行检测、语义分割，或一次同时完成二者；
 * 依据 `--save-visuals` 选项输出检测框/语义伪彩等中间可视化结果。
 
 使用示例：
@@ -37,6 +37,7 @@ import argparse
 import json
 import logging
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -466,8 +467,11 @@ def run_segmentation_inference(
 
         with torch.inference_mode():
             autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-            autocast_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
-            with torch.autocast(autocast_device, dtype=autocast_dtype):
+            if dtype in (torch.float16, torch.bfloat16):
+                autocast_context = torch.autocast(autocast_device, dtype=dtype)
+            else:
+                autocast_context = nullcontext()
+            with autocast_context:
                 _ = segmentor(tensor)
                 segmentation = make_inference(
                     tensor,
@@ -519,8 +523,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if need_segmentation and not args.segmentation_adapter:
         raise ValueError("task 包含 segmentation 时必须提供 --segmentation-adapter")
 
-    dtype = torch.float16
-    LOGGER.info("推理统一使用 float16 精度")
+    dtype = torch.float32
+    LOGGER.info("推理统一使用 float32 精度")
 
     max_memory = build_max_memory(args.max_memory)
 
