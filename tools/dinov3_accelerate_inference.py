@@ -1,4 +1,4 @@
-"""DINOv3 detection & segmentation inference - 单卡/多卡自适应版本."""
+"""DINOv3 detection & segmentation inference - 单卡版本."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import json
 import logging
 import os
 import shutil
-from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from torchvision.transforms import v2
 
@@ -25,7 +25,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DINOv3 推理脚本 (单卡/多卡自适应)")
+    parser = argparse.ArgumentParser(description="DINOv3 推理脚本（单卡版本）")
     parser.add_argument("--repo", required=True, help="本地 DINOv3 仓库路径")
     parser.add_argument(
         "--task",
@@ -48,42 +48,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="输入图像目录或单张图片路径",
     )
     parser.add_argument("--output", required=True, help="输出目录")
-    
-    # 设备配置
-    device_group = parser.add_mutually_exclusive_group()
-    device_group.add_argument(
+    parser.add_argument(
         "--device",
-        default=None,
-        help="单卡模式：指定单个 GPU (如 cuda:0)",
-    )
-    device_group.add_argument(
-        "--device-map",
-        default=None,
-        help="多卡模式：Accelerate device_map (如 auto)",
-    )
-    
-    parser.add_argument(
-        "--visible-devices",
-        default=None,
-        help="多卡模式：显式设置 CUDA_VISIBLE_DEVICES",
-    )
-    parser.add_argument(
-        "--min-gpus",
-        type=int,
-        default=0,
-        help="多卡模式：要求可见的最少 GPU 数",
-    )
-    parser.add_argument(
-        "--max-memory",
-        default=None,
-        help="多卡模式：每张 GPU 的最大可用显存（GiB）",
+        default="cuda:0",
+        help="GPU 设备，默认 cuda:0",
     )
     
     # 检测参数
     parser.add_argument(
         "--confidence-threshold",
         type=float,
-        default=0.8,
+        default=0.5,
         help="检测置信度阈值，默认 0.5",
     )
     parser.add_argument(
@@ -93,21 +68,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="每张图像最多保留的检测数，默认 100",
     )
     
+    # 分割参数
     parser.add_argument(
         "--image-size",
         type=int,
         default=896,
-        help="输入图像统一 resize 大小",
+        help="分割输入图像大小，默认 896",
     )
-    parser.add_argument("--save-visuals", action="store_true", help="保存可视化结果")
     parser.add_argument(
         "--color-map",
         default="Spectral",
-        help="语义分割 colormap",
+        help="语义分割 colormap，默认 Spectral",
     )
-    parser.add_argument(
-        "--no-split", nargs="*", default=["Block"], help="多卡模式：禁止拆分的模块"
-    )
+    
+    parser.add_argument("--save-visuals", action="store_true", help="保存可视化结果")
     parser.add_argument(
         "--clear-cache",
         action="store_true",
@@ -139,6 +113,7 @@ def resolve_path(path: str | os.PathLike[str]) -> Path:
 
 
 def list_images(path: Path) -> List[Path]:
+    """列出所有图像文件"""
     if path.is_file():
         return [path]
     if not path.exists():
@@ -150,6 +125,7 @@ def list_images(path: Path) -> List[Path]:
 
 
 def resolve_tasks(task: str) -> Tuple[bool, bool]:
+    """解析任务类型"""
     if task == "detection":
         return True, False
     if task == "segmentation":
@@ -182,330 +158,147 @@ def verify_checkpoint(checkpoint_path: Path) -> bool:
     LOGGER.info("Checkpoint 文件大小: %.2f GB", file_size_gb)
     
     if "lvd1689m" in checkpoint_path.name and file_size_gb < 15:
-        LOGGER.error("=" * 70)
         LOGGER.error("Checkpoint 文件可能不完整！")
-        LOGGER.error("当前大小: %.2f GB，期望大小: ~16 GB", file_size_gb)
-        LOGGER.error("请重新下载: %s", checkpoint_path)
-        LOGGER.error("=" * 70)
         return False
     
     try:
         LOGGER.info("验证 checkpoint 文件完整性...")
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         LOGGER.info("✓ Checkpoint 文件验证通过")
+        LOGGER.debug("Checkpoint 包含 %d 个参数", len(state_dict))
         del state_dict
         return True
     except Exception as exc:
-        LOGGER.error("=" * 70)
         LOGGER.error("Checkpoint 文件损坏: %s", exc)
-        LOGGER.error("文件路径: %s", checkpoint_path)
-        LOGGER.error("")
-        LOGGER.error("解决方案：")
-        LOGGER.error("1. 删除损坏的文件:")
-        LOGGER.error("   rm '%s'", checkpoint_path)
-        LOGGER.error("2. 清理 torch.hub 缓存:")
-        LOGGER.error("   rm -rf ~/.cache/torch/hub/checkpoints/*")
-        LOGGER.error("3. 重新下载完整的 checkpoint 文件")
-        LOGGER.error("=" * 70)
         return False
 
 
-def apply_visible_devices(spec: Optional[str]) -> None:
-    if spec is None:
-        return
-    value = spec.strip()
-    if not value:
-        raise ValueError("--visible-devices 不能为空")
-    os.environ["CUDA_VISIBLE_DEVICES"] = value
-    LOGGER.info("设置 CUDA_VISIBLE_DEVICES=%s", value)
-    if torch.cuda.is_available():
-        torch.cuda.device_count()
-
-
-def ensure_minimum_gpus(min_required: int) -> Sequence[int]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("未检测到 CUDA 设备")
-    count = torch.cuda.device_count()
-    indices = list(range(count))
-    if min_required > 0 and count < min_required:
-        raise RuntimeError(f"仅检测到 {count} 张 GPU，低于要求的 {min_required} 张")
-    device_names = [torch.cuda.get_device_name(i) for i in indices]
-    LOGGER.info("当前可见 GPU：%s", ", ".join(f"{i}:{name}" for i, name in zip(indices, device_names)))
-    return indices
-
-
-@contextmanager
-def temporarily_disable_cuda_for_hub() -> Iterator[bool]:
-    """暂时屏蔽 CUDA，让 torch.hub 在 CPU 上初始化"""
-    if not torch.cuda.is_available():
-        yield False
-        return
-
-    original_is_available = torch.cuda.is_available
-    original_device_count = torch.cuda.device_count
-    visible_backup = os.environ.get("CUDA_VISIBLE_DEVICES")
-
-    def _false() -> bool:
-        return False
-
-    def _zero() -> int:
-        return 0
-
-    torch.cuda.is_available = _false  # type: ignore[assignment]
-    torch.cuda.device_count = _zero  # type: ignore[assignment]
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-    try:
-        yield True
-    finally:
-        torch.cuda.is_available = original_is_available  # type: ignore[assignment]
-        torch.cuda.device_count = original_device_count  # type: ignore[assignment]
-        if visible_backup is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = visible_backup
-        try:
-            torch.cuda.device_count()
-        except Exception:
-            pass
-
-
-def load_torch_hub_model(repo: Path, entrypoint: str, **kwargs):
-    """加载 torch.hub 模型，在 CPU 上初始化"""
-    load_kwargs = dict(kwargs)
-    load_kwargs.setdefault("source", "local")
+def load_detection_model(repo: Path, device: str, backbone_weights: str, adapter_weights: str):
+    """加载检测模型，显式加载权重"""
+    LOGGER.info("加载检测模型...")
     
-    with temporarily_disable_cuda_for_hub() as disabled:
-        try:
-            model = torch.hub.load(str(repo), entrypoint, **load_kwargs)
-        except RuntimeError as exc:
-            error_msg = str(exc)
-            if "PytorchStreamReader failed" in error_msg or "failed finding central directory" in error_msg:
-                LOGGER.error("=" * 70)
-                LOGGER.error("Checkpoint 文件已损坏！")
-                LOGGER.error("=" * 70)
-                LOGGER.error("错误: %s", exc)
-                LOGGER.error("")
-                LOGGER.error("修复步骤:")
-                LOGGER.error("1. 清理 torch.hub 缓存:")
-                LOGGER.error("   rm -rf ~/.cache/torch/hub/checkpoints/*")
-                LOGGER.error("")
-                LOGGER.error("2. 验证你的 checkpoint 文件:")
-                if kwargs.get("backbone_weights"):
-                    LOGGER.error("   ls -lh %s", kwargs["backbone_weights"])
-                if kwargs.get("weights"):
-                    LOGGER.error("   ls -lh %s", kwargs["weights"])
-                LOGGER.error("")
-                LOGGER.error("3. 如果文件不完整，请重新下载")
-                LOGGER.error("=" * 70)
-            raise
-
-    if disabled and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # 确保模型在 CPU 上
-    if isinstance(model, torch.nn.Module):
-        model.to("cpu")
-    if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
-        model.model.to("cpu")
-
+    # 方式1: 使用 torch.hub.load（让 hubconf 处理权重加载）
+    try:
+        model = torch.hub.load(
+            str(repo),
+            "dinov3_vit7b16_de",
+            source="local",
+            weights=adapter_weights,
+            backbone_weights=backbone_weights,
+            pretrained=True,
+        )
+        LOGGER.debug("✓ 通过 torch.hub.load 加载成功")
+    except Exception as e:
+        LOGGER.warning("torch.hub.load 失败: %s，尝试手动加载", e)
+        
+        # 方式2: 手动加载（如果 torch.hub 失败）
+        import sys
+        sys.path.insert(0, str(repo))
+        from dinov3.models.vision_transformer import vit_large
+        from dinov3.eval.detection.models import Detector
+        
+        # 加载 backbone
+        backbone = vit_large(patch_size=16, num_register_tokens=4)
+        backbone_state = torch.load(backbone_weights, map_location="cpu")
+        if 'model' in backbone_state:
+            backbone_state = backbone_state['model']
+        backbone.load_state_dict(backbone_state, strict=False)
+        
+        # 加载检测头
+        model = Detector(backbone, num_classes=80)
+        adapter_state = torch.load(adapter_weights, map_location="cpu")
+        if 'model' in adapter_state:
+            adapter_state = adapter_state['model']
+        model.load_state_dict(adapter_state, strict=False)
+        
+        LOGGER.debug("✓ 通过手动加载成功")
+    
+    model = model.to(device)
+    model.eval()
+    LOGGER.info("✓ 检测模型已加载到 %s", device)
+    
     return model
 
 
-def build_max_memory(arg: Optional[str], available_devices: Sequence[int]) -> Optional[Dict[int, str]]:
-    """构建 max_memory 配置（多卡模式）"""
-    if not torch.cuda.is_available() or not available_devices:
-        return None
-
-    if arg is None:
-        memory: Dict[int, str] = {}
-        for idx in available_devices:
-            props = torch.cuda.get_device_properties(idx)
-            total_gb = props.total_memory // (1024**3)
-            usable = max(total_gb - 2, 1)
-            memory[idx] = f"{usable}GiB"
-        return memory
-
-    memory: Dict[int, str] = {}
-    value = arg.strip()
-    if value.lower().endswith("gib"):
-        value = value[:-3]
-    for idx in available_devices:
-        memory[idx] = f"{float(value)}GiB"
-    return memory
-
-
-def prepare_device_map(
-    model: torch.nn.Module,
-    *,
-    device_map_option: str,
-    max_memory: Optional[Dict[int, str]],
-    no_split: Sequence[str],
-) -> Tuple[Mapping[str, str] | str, Optional[str]]:
-    """多卡模式：准备 device_map"""
-    if device_map_option != "auto":
-        LOGGER.info("使用手动 device_map: %s", device_map_option)
-        return device_map_option, None
-
-    if not torch.cuda.is_available():
-        LOGGER.warning("未检测到 CUDA，使用 CPU")
-        return "cpu", None
-
-    from accelerate.utils import infer_auto_device_map
-
-    dtype = torch.float32  # 统一使用 float32
+def load_segmentation_model(repo: Path, device: str, backbone_weights: str, adapter_weights: str):
+    """加载分割模型，显式加载权重"""
+    LOGGER.info("加载分割模型...")
     
-    device_map = infer_auto_device_map(
-        model,
-        max_memory=max_memory,
-        no_split_module_classes=list(no_split),
-        dtype=dtype,
-    )
-
-    primary = next((device for device in device_map.values() if device != "cpu"), "cpu")
-    LOGGER.info("推断 device_map，primary device: %s", primary)
-    return device_map, primary
-
-
-def dispatch_model_if_needed(
-    hub_model,
-    *,
-    device_map: Mapping[str, str] | str,
-) -> Tuple[torch.nn.Module, Optional[str]]:
-    """多卡模式：分片模型"""
-    from accelerate import dispatch_model
-
-    if isinstance(device_map, str):
-        target_device = device_map
-        if hasattr(hub_model, "model") and isinstance(hub_model.model, torch.nn.Module):
-            hub_model.model.to(target_device)
-            return hub_model.model, target_device
-        return hub_model.to(target_device), target_device  # type: ignore[return-value]
-
-    module = hub_model
-    if hasattr(hub_model, "model") and isinstance(hub_model.model, torch.nn.Module):
-        module = hub_model.model
-
-    if next(module.parameters(), None) is not None:
-        current_device = next(module.parameters()).device
-        if current_device.type == "cuda":
-            module.to("cpu")
-            torch.cuda.empty_cache()
-
-    sharded = dispatch_model(module, device_map=device_map)
-    if hasattr(hub_model, "model"):
-        hub_model.model = sharded
+    # 方式1: 使用 torch.hub.load
+    try:
+        model = torch.hub.load(
+            str(repo),
+            "dinov3_vit7b16_ms",
+            source="local",
+            weights=adapter_weights,
+            backbone_weights=backbone_weights,
+            pretrained=True,
+        )
+        LOGGER.debug("✓ 通过 torch.hub.load 加载成功")
+    except Exception as e:
+        LOGGER.warning("torch.hub.load 失败: %s，尝试手动加载", e)
+        
+        # 方式2: 手动加载
+        import sys
+        sys.path.insert(0, str(repo))
+        from dinov3.models.vision_transformer import vit_large
+        from dinov3.eval.segmentation.models import Segmentor
+        
+        # 加载 backbone
+        backbone = vit_large(patch_size=16, num_register_tokens=4)
+        backbone_state = torch.load(backbone_weights, map_location="cpu")
+        if 'model' in backbone_state:
+            backbone_state = backbone_state['model']
+        backbone.load_state_dict(backbone_state, strict=False)
+        
+        # 加载分割头
+        model = Segmentor(backbone, num_classes=150)
+        adapter_state = torch.load(adapter_weights, map_location="cpu")
+        if 'model' in adapter_state:
+            adapter_state = adapter_state['model']
+        model.load_state_dict(adapter_state, strict=False)
+        
+        LOGGER.debug("✓ 通过手动加载成功")
     
-    primary = next((device for device in set(device_map.values()) if device != "cpu"), "cpu")
-    return sharded, primary
+    model = model.to(device)
+    model.eval()
+    LOGGER.info("✓ 分割模型已加载到 %s", device)
+    
+    return model
 
 
 # ---------------------------------------------------------------------------
-# Detection & Segmentation
+# Detection
 # ---------------------------------------------------------------------------
 
 
 def coco_class_names() -> List[str]:
-    """
-    COCO 数据集的 80 个类别名称。
-    注意：COCO 类别 ID 是 1-90，但只有 80 个有效类别。
-    某些 ID 被跳过了（如 12, 26, 29, 30, 45, 66, 68, 69, 71, 83, 91）
-    """
-    # 完整的 COCO 类别映射（索引对应类别ID）
-    # ID 0 通常是背景类，但在检测输出中可能不使用
+    """COCO 80 类类别名称（索引 0-79）"""
     return [
-        "__background__",  # 0 (某些实现会包含背景类)
-        "person",          # 1
-        "bicycle",         # 2
-        "car",             # 3
-        "motorcycle",      # 4
-        "airplane",        # 5
-        "bus",             # 6
-        "train",           # 7
-        "truck",           # 8
-        "boat",            # 9
-        "traffic light",   # 10
-        "fire hydrant",    # 11
-        "street sign",     # 12 (通常跳过)
-        "stop sign",       # 13
-        "parking meter",   # 14
-        "bench",           # 15
-        "bird",            # 16
-        "cat",             # 17
-        "dog",             # 18
-        "horse",           # 19
-        "sheep",           # 20
-        "cow",             # 21
-        "elephant",        # 22
-        "bear",            # 23
-        "zebra",           # 24
-        "giraffe",         # 25
-        "hat",             # 26 (通常跳过)
-        "backpack",        # 27
-        "umbrella",        # 28
-        "shoe",            # 29 (通常跳过)
-        "eye glasses",     # 30 (通常跳过)
-        "handbag",         # 31
-        "tie",             # 32
-        "suitcase",        # 33
-        "frisbee",         # 34
-        "skis",            # 35
-        "snowboard",       # 36
-        "sports ball",     # 37
-        "kite",            # 38
-        "baseball bat",    # 39
-        "baseball glove",  # 40
-        "skateboard",      # 41
-        "surfboard",       # 42
-        "tennis racket",   # 43
-        "bottle",          # 44
-        "plate",           # 45 (通常跳过)
-        "wine glass",      # 46
-        "cup",             # 47
-        "fork",            # 48
-        "knife",           # 49
-        "spoon",           # 50
-        "bowl",            # 51
-        "banana",          # 52
-        "apple",           # 53
-        "sandwich",        # 54
-        "orange",          # 55
-        "broccoli",        # 56
-        "carrot",          # 57
-        "hot dog",         # 58
-        "pizza",           # 59
-        "donut",           # 60
-        "cake",            # 61
-        "chair",           # 62
-        "couch",           # 63
-        "potted plant",    # 64
-        "bed",             # 65
-        "mirror",          # 66 (通常跳过)
-        "dining table",    # 67
-        "window",          # 68 (通常跳过)
-        "desk",            # 69 (通常跳过)
-        "toilet",          # 70
-        "door",            # 71 (通常跳过)
-        "tv",              # 72
-        "laptop",          # 73
-        "mouse",           # 74
-        "remote",          # 75
-        "keyboard",        # 76
-        "cell phone",      # 77
-        "microwave",       # 78
-        "oven",            # 79
-        "toaster",         # 80
-        "sink",            # 81
-        "refrigerator",    # 82
-        "blender",         # 83 (通常跳过)
-        "book",            # 84
-        "clock",           # 85
-        "vase",            # 86
-        "scissors",        # 87
-        "teddy bear",      # 88
-        "hair drier",      # 89
-        "toothbrush",      # 90
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+        "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+        "toothbrush",
     ]
+
+
+def get_coco_class_name(label_id: int) -> str:
+    """获取 COCO 类别名称，自动处理 0-based 或 1-based 索引"""
+    class_names = coco_class_names()
+    
+    if 1 <= label_id <= 80:
+        return class_names[label_id - 1]
+    elif 0 <= label_id < 80:
+        return class_names[label_id]
+    else:
+        return f"class_{label_id}"
 
 
 def annotate_detections(
@@ -513,8 +306,8 @@ def annotate_detections(
     boxes: Sequence[Sequence[float]],
     classes: Sequence[int],
     scores: Sequence[float],
-    class_names: Sequence[str],
 ) -> Image.Image:
+    """在图像上绘制检测框"""
     annotated = image.convert("RGB").copy()
     draw = ImageDraw.Draw(annotated)
     try:
@@ -524,9 +317,11 @@ def annotate_detections(
 
     for bbox, cls, score in zip(boxes, classes, scores):
         x1, y1, x2, y2 = bbox
-        label = class_names[int(cls)] if int(cls) < len(class_names) else str(cls)
+        label = get_coco_class_name(int(cls))
         caption = f"{label}: {score:.2f}"
+        
         draw.rectangle([(x1, y1), (x2, y2)], outline=(255, 0, 0), width=3)
+        
         text_bbox = draw.textbbox((x1, y1 - 20), caption, font=font)
         text_w = text_bbox[2] - text_bbox[0]
         text_h = text_bbox[3] - text_bbox[1]
@@ -541,201 +336,130 @@ def run_detection_inference(
     predictor,
     images: Iterable[Path],
     output_dir: Path,
+    device: str,
     *,
     save_visuals: bool,
     confidence_threshold: float = 0.5,
     max_detections: int = 100,
 ) -> None:
-    import numpy as np
-
-    class_names = coco_class_names()
+    """执行检测推理"""
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 获取模型的 device
-    model_device = torch.device("cuda:0")
-    try:
-        if hasattr(predictor, "model") and hasattr(predictor.model, "parameters"):
-            first_param = next(predictor.model.parameters())
-            model_device = first_param.device
-        elif hasattr(predictor, "parameters"):
-            first_param = next(predictor.parameters())
-            model_device = first_param.device
-        elif hasattr(predictor, "detector") and hasattr(predictor.detector, "parameters"):
-            first_param = next(predictor.detector.parameters())
-            model_device = first_param.device
-    except (StopIteration, AttributeError):
-        pass
     
-    LOGGER.info("检测推理使用 device: %s, dtype: float32", model_device)
-    LOGGER.info("置信度阈值: %.2f, 最大检测数: %d", confidence_threshold, max_detections)
+    LOGGER.info("检测推理 | 设备: %s, dtype: float32", device)
+    LOGGER.info("检测参数 | 置信度阈值: %.2f, 最大检测数: %d", confidence_threshold, max_detections)
 
     for image_path in images:
-        LOGGER.info("[detection] 处理 %s", image_path.name)
+        LOGGER.info("[检测] 处理 %s", image_path.name)
         image = Image.open(image_path).convert("RGB")
         
-        # 转换为 tensor: [C, H, W]，归一化到 [0, 1]
         image_array = np.array(image).astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
+        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0)
+        batch = image_tensor.to(device)
         
-        # 创建 batch: [1, C, H, W]
-        batch = image_tensor.unsqueeze(0)
-        
-        # 移动到模型设备
-        batch = batch.to(device=model_device)
-        
-        LOGGER.debug("输入 tensor shape: %s, device: %s, dtype: %s", 
-                     batch.shape, batch.device, batch.dtype)
-        
-        # 推理
         with torch.inference_mode():
             outputs = predictor(batch)
         
-        # 处理输出 - DINOv3 格式是 [{'scores': ..., 'labels': ..., 'boxes': ...}]
-        if isinstance(outputs, list) and len(outputs) > 0:
-            output = outputs[0]
-            if isinstance(output, dict):
-                # DINOv3 检测器的标准输出格式
-                if 'boxes' in output and 'scores' in output and 'labels' in output:
-                    LOGGER.debug("检测到 DINOv3 标准输出格式")
-                    
-                    # 提取结果并移到 CPU
-                    boxes_tensor = output['boxes']
-                    scores_tensor = output['scores']
-                    labels_tensor = output['labels']
-                    
-                    # 转换为 numpy
-                    if isinstance(boxes_tensor, torch.Tensor):
-                        boxes = boxes_tensor.cpu().numpy()
-                        scores = scores_tensor.cpu().numpy()
-                        classes = labels_tensor.cpu().numpy()
-                    else:
-                        boxes = np.array(boxes_tensor)
-                        scores = np.array(scores_tensor)
-                        classes = np.array(classes_tensor)
-                    
-                    LOGGER.info("原始检测数: %d", len(boxes))
-                    
-                    # 应用置信度阈值过滤
-                    confidence_mask = scores >= confidence_threshold
-                    boxes = boxes[confidence_mask]
-                    scores = scores[confidence_mask]
-                    classes = classes[confidence_mask]
-                    
-                    LOGGER.info("置信度过滤后: %d 个目标 (阈值: %.2f)", 
-                               len(boxes), confidence_threshold)
-                    
-                    # 按置信度排序，保留 top-k
-                    if len(boxes) > max_detections:
-                        top_indices = np.argsort(scores)[::-1][:max_detections]
-                        boxes = boxes[top_indices]
-                        scores = scores[top_indices]
-                        classes = classes[top_indices]
-                        LOGGER.info("保留 top-%d 检测结果", max_detections)
-                    
-                    LOGGER.info("最终检测到 %d 个目标", len(boxes))
-                    
-                    # 转换为 list 用于 JSON 序列化
-                    boxes = boxes.tolist()
-                    scores = scores.tolist()
-                    classes = classes.tolist()
-                    
-                    # 构建结果记录
-                    records = []
-                    for bbox, score, cls in zip(boxes, scores, classes):
-                        records.append({
-                            "bbox_xyxy": bbox,
-                            "score": float(score),
-                            "category_id": int(cls),
-                            "category_name": class_names[int(cls)] if int(cls) < len(class_names) else str(cls),
-                        })
-                    
-                    # 保存 JSON
-                    json_path = output_dir / f"{image_path.stem}_detections.json"
-                    with json_path.open("w", encoding="utf-8") as f:
-                        json.dump(records, f, ensure_ascii=False, indent=2)
-                    LOGGER.info("保存检测结果: %s", json_path)
-                    
-                    # 保存可视化
-                    if save_visuals and boxes:
-                        annotated = annotate_detections(image, boxes, classes, scores, class_names)
-                        vis_path = output_dir / f"{image_path.stem}_detection_overlay.png"
-                        annotated.save(vis_path)
-                        LOGGER.info("保存可视化: %s", vis_path)
-                    
-                    continue
-        
-        # 如果上面的处理没有成功，尝试传统的 Detectron2 格式
-        instances = None
-        
-        if isinstance(outputs, dict) and "instances" in outputs:
-            instances = outputs["instances"]
-            LOGGER.debug("从 dict 提取 instances")
-        elif isinstance(outputs, list) and len(outputs) > 0:
-            output = outputs[0]
-            if isinstance(output, dict) and "instances" in output:
-                instances = output["instances"]
-                LOGGER.debug("从 list[0] dict 提取 instances")
-            elif hasattr(output, "pred_boxes"):
-                instances = output
-                LOGGER.debug("list[0] 直接是 instances 对象")
-        elif hasattr(outputs, "pred_boxes"):
-            instances = outputs
-            LOGGER.debug("输出直接是 instances 对象")
-        
-        if instances is None:
-            LOGGER.error("=" * 70)
-            LOGGER.error("无法从输出中提取检测结果")
-            LOGGER.error("输出类型: %s", type(outputs))
-            if isinstance(outputs, dict):
-                LOGGER.error("输出键: %s", list(outputs.keys()))
-            elif isinstance(outputs, list) and len(outputs) > 0:
-                LOGGER.error("输出列表长度: %d", len(outputs))
-                LOGGER.error("第一个元素类型: %s", type(outputs[0]))
-                if isinstance(outputs[0], dict):
-                    LOGGER.error("第一个元素键: %s", list(outputs[0].keys()))
-            LOGGER.error("=" * 70)
+        if not isinstance(outputs, list) or len(outputs) == 0:
+            LOGGER.error("无法解析检测输出")
+            continue
+            
+        output = outputs[0]
+        if not isinstance(output, dict) or not all(k in output for k in ['boxes', 'scores', 'labels']):
+            LOGGER.error("无法解析检测输出")
             continue
         
-        # Detectron2 格式处理（带过滤）
-        instances = instances.to("cpu")
+        boxes_tensor = output['boxes']
+        scores_tensor = output['scores']
+        labels_tensor = output['labels']
         
-        # 应用置信度阈值
-        keep = instances.scores >= confidence_threshold
-        instances = instances[keep]
+        if isinstance(boxes_tensor, torch.Tensor):
+            boxes = boxes_tensor.cpu().numpy()
+            scores = scores_tensor.cpu().numpy()
+            classes = labels_tensor.cpu().numpy()
+        else:
+            boxes = np.array(boxes_tensor)
+            scores = np.array(scores_tensor)
+            classes = np.array(labels_tensor)
         
-        # 按置信度排序并保留 top-k
-        if len(instances) > max_detections:
-            top_indices = instances.scores.argsort(descending=True)[:max_detections]
-            instances = instances[top_indices]
+        LOGGER.debug("原始检测数: %d, 标签范围: [%d, %d]", 
+                    len(boxes), int(classes.min()), int(classes.max()))
         
-        boxes = instances.pred_boxes.tensor.numpy().tolist()
-        scores = instances.scores.numpy().tolist()
-        classes = instances.pred_classes.numpy().tolist()
+        confidence_mask = scores >= confidence_threshold
+        boxes = boxes[confidence_mask]
+        scores = scores[confidence_mask]
+        classes = classes[confidence_mask]
         
-        LOGGER.info("最终检测到 %d 个目标", len(boxes))
+        LOGGER.debug("置信度过滤后: %d (阈值: %.2f)", len(boxes), confidence_threshold)
+        
+        if len(boxes) > max_detections:
+            top_indices = np.argsort(scores)[::-1][:max_detections]
+            boxes = boxes[top_indices]
+            scores = scores[top_indices]
+            classes = classes[top_indices]
+        
+        LOGGER.info("✓ 检测到 %d 个目标", len(boxes))
+        
+        boxes_list = boxes.tolist()
+        scores_list = scores.tolist()
+        classes_list = classes.tolist()
         
         records = []
-        for bbox, score, cls in zip(boxes, scores, classes):
+        for bbox, score, cls in zip(boxes_list, scores_list, classes_list):
+            cls_int = int(cls)
             records.append({
                 "bbox_xyxy": bbox,
                 "score": float(score),
-                "category_id": int(cls),
-                "category_name": class_names[int(cls)] if int(cls) < len(class_names) else str(cls),
+                "category_id": cls_int,
+                "category_name": get_coco_class_name(cls_int),
             })
         
         json_path = output_dir / f"{image_path.stem}_detections.json"
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
-        LOGGER.info("保存检测结果: %s", json_path)
+        LOGGER.debug("保存 JSON: %s", json_path)
         
-        if save_visuals and boxes:
-            annotated = annotate_detections(image, boxes, classes, scores, class_names)
+        if save_visuals and boxes_list:
+            annotated = annotate_detections(image, boxes_list, classes_list, scores_list)
             vis_path = output_dir / f"{image_path.stem}_detection_overlay.png"
             annotated.save(vis_path)
-            LOGGER.info("保存可视化: %s", vis_path)
+            LOGGER.debug("保存可视化: %s", vis_path)
+
+
+# ---------------------------------------------------------------------------
+# Segmentation
+# ---------------------------------------------------------------------------
+
+
+def ade20k_class_names() -> List[str]:
+    """ADE20K 150 类类别名称（索引 0-149）"""
+    return [
+        'wall', 'building', 'sky', 'floor', 'tree', 'ceiling', 'road', 'bed',
+        'windowpane', 'grass', 'cabinet', 'sidewalk', 'person', 'earth', 'door',
+        'table', 'mountain', 'plant', 'curtain', 'chair', 'car', 'water',
+        'painting', 'sofa', 'shelf', 'house', 'sea', 'mirror', 'rug', 'field',
+        'armchair', 'seat', 'fence', 'desk', 'rock', 'wardrobe', 'lamp',
+        'bathtub', 'railing', 'cushion', 'base', 'box', 'column', 'signboard',
+        'chest of drawers', 'counter', 'sand', 'sink', 'skyscraper', 'fireplace',
+        'refrigerator', 'grandstand', 'path', 'stairs', 'runway', 'case',
+        'pool table', 'pillow', 'screen door', 'stairway', 'river', 'bridge',
+        'bookcase', 'blind', 'coffee table', 'toilet', 'flower', 'book', 'hill',
+        'bench', 'countertop', 'stove', 'palm', 'kitchen island', 'computer',
+        'swivel chair', 'boat', 'bar', 'arcade machine', 'hovel', 'bus', 'towel',
+        'light', 'truck', 'tower', 'chandelier', 'awning', 'streetlight', 'booth',
+        'television', 'airplane', 'dirt track', 'apparel', 'pole', 'land',
+        'bannister', 'escalator', 'ottoman', 'bottle', 'buffet', 'poster', 'stage',
+        'van', 'ship', 'fountain', 'conveyer belt', 'canopy', 'washer', 'plaything',
+        'swimming pool', 'stool', 'barrel', 'basket', 'waterfall', 'tent', 'bag',
+        'minibike', 'cradle', 'oven', 'ball', 'food', 'step', 'tank', 'trade name',
+        'microwave', 'pot', 'animal', 'bicycle', 'lake', 'dishwasher', 'screen',
+        'blanket', 'sculpture', 'hood', 'sconce', 'vase', 'traffic light', 'tray',
+        'ashcan', 'fan', 'pier', 'crt screen', 'plate', 'monitor', 'bulletin board',
+        'shower', 'radiator', 'glass', 'clock', 'flag'
+    ]
 
 
 def build_segmentation_transform(image_size: int) -> v2.Compose:
+    """构建分割预处理流程"""
     return v2.Compose([
         v2.ToImage(),
         v2.Resize((image_size, image_size), antialias=True),
@@ -748,54 +472,356 @@ def run_segmentation_inference(
     segmentor: torch.nn.Module,
     images: Iterable[Path],
     output_dir: Path,
-    *,
     device: str,
+    *,
     image_size: int,
     save_visuals: bool,
     color_map: str,
 ) -> None:
+    """执行语义分割推理（Mask2Former 风格模型）- 优化可视化"""
     import matplotlib
-    from functools import partial
-    from dinov3.eval.segmentation.inference import make_inference
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    import random
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cmap = matplotlib.colormaps.get_cmap(color_map)
     transform = build_segmentation_transform(image_size)
+    class_names = ade20k_class_names()
 
-    LOGGER.info("分割推理使用 device: %s, dtype: float32", device)
+    LOGGER.info("分割推理 | 设备: %s, dtype: float32", device)
+    LOGGER.info("分割参数 | 图像大小: %d, 配色: %s", image_size, color_map)
 
     for image_path in images:
-        LOGGER.info("[segmentation] 处理 %s", image_path.name)
+        LOGGER.info("[分割] 处理 %s", image_path.name)
         image = Image.open(image_path).convert("RGB")
+        original_size = image.size  # (W, H)
+        
+        LOGGER.debug("原始图像大小: %s", original_size)
+        
+        # 预处理
         tensor = transform(image).unsqueeze(0).to(device, dtype=torch.float32)
+        LOGGER.debug("输入 tensor shape: %s", tensor.shape)
 
+        # 推理
         with torch.inference_mode():
-            _ = segmentor(tensor)
-            segmentation = make_inference(
-                tensor,
-                segmentor,
-                inference_mode="slide",
-                decoder_head_type="m2f",
-                rescale_to=image.size[::-1],
-                n_output_channels=150,
-                crop_size=(image_size, image_size),
-                stride=(image_size, image_size),
-                output_activation=partial(torch.nn.functional.softmax, dim=1),
-            ).argmax(dim=1, keepdim=True)
-
-        array = segmentation[0, 0].to("cpu", dtype=torch.int32).numpy().astype("uint16")
-        seg_image = Image.fromarray(array, mode="I;16")
+            output = segmentor(tensor)
+            
+            if not isinstance(output, dict) or 'pred_masks' not in output or 'pred_logits' not in output:
+                LOGGER.error("输出格式错误")
+                continue
+            
+            pred_masks = output['pred_masks']
+            pred_logits = output['pred_logits']
+            
+            LOGGER.debug("pred_logits shape: %s", pred_logits.shape)
+            LOGGER.debug("pred_masks shape: %s", pred_masks.shape)
+            
+            # 转换类型
+            if pred_logits.dtype == torch.bfloat16:
+                pred_logits = pred_logits.to(torch.float32)
+            if pred_masks.dtype == torch.bfloat16:
+                pred_masks = pred_masks.to(torch.float32)
+            
+            pred_logits = pred_logits[0]
+            pred_masks = pred_masks[0]
+            
+            # 获取类别概率
+            pred_probs = pred_logits.softmax(dim=-1)
+            fg_probs = pred_probs[:, :-1]
+            bg_probs = pred_probs[:, -1]
+            fg_max_probs, fg_max_classes = fg_probs.max(dim=-1)
+            
+            # 过滤条件
+            fg_confidence_threshold = 0.5
+            valid_mask = (fg_max_probs > bg_probs) & (fg_max_probs > fg_confidence_threshold)
+            
+            LOGGER.info("有效前景查询: %d / 100", valid_mask.sum().item())
+            
+            # 上采样掩码
+            pred_masks_resized = torch.nn.functional.interpolate(
+                pred_masks.unsqueeze(0),
+                size=(original_size[1], original_size[0]),
+                mode='bilinear',
+                align_corners=False
+            )[0]
+            
+            pred_masks_sigmoid = pred_masks_resized.sigmoid()
+            
+            # 初始化分割图
+            final_seg = torch.zeros(
+                (original_size[1], original_size[0]), 
+                dtype=torch.long,
+                device=device
+            )
+            
+            max_mask_scores = torch.zeros(
+                (original_size[1], original_size[0]), 
+                dtype=torch.float32,
+                device=device
+            )
+            
+            mask_threshold = 0.5
+            min_area = 50
+            
+            valid_queries_info = []
+            
+            # 处理每个有效查询
+            for query_idx in range(100):
+                if not valid_mask[query_idx]:
+                    continue
+                
+                class_id = fg_max_classes[query_idx].item()
+                class_prob = fg_max_probs[query_idx].item()
+                bg_prob = bg_probs[query_idx].item()
+                mask = pred_masks_sigmoid[query_idx]
+                
+                binary_mask = mask > mask_threshold
+                mask_area = binary_mask.sum().item()
+                
+                if mask_area < min_area:
+                    continue
+                
+                valid_queries_info.append({
+                    'query': query_idx,
+                    'class': class_id,
+                    'fg_prob': class_prob,
+                    'bg_prob': bg_prob,
+                    'area': mask_area,
+                })
+                
+                weighted_mask = mask * class_prob
+                update_mask = weighted_mask > max_mask_scores
+                
+                final_seg[update_mask] = class_id
+                max_mask_scores[update_mask] = weighted_mask[update_mask]
+            
+            LOGGER.info("最终有效查询: %d", len(valid_queries_info))
+            
+            # 显示查询信息
+            if valid_queries_info:
+                for info in sorted(valid_queries_info, key=lambda x: -x['fg_prob']):
+                    class_name = class_names[info['class']] if info['class'] < len(class_names) else f"class_{info['class']}"
+                    LOGGER.info(
+                        "  查询 %3d: %-20s | 概率: %.3f | 面积: %6d px",
+                        info['query'], class_name, info['fg_prob'], info['area']
+                    )
+            
+            seg_array = final_seg.cpu().numpy().astype(np.uint8)
+        
+        # 统计
+        unique_labels = np.unique(seg_array)
+        label_counts = Counter(seg_array.flatten())
+        total_pixels = seg_array.size
+        
+        fg_pixels = total_pixels - label_counts.get(0, 0)
+        fg_coverage = fg_pixels / total_pixels * 100
+        
+        LOGGER.info("检测到类别: %d | 前景覆盖: %.1f%%", 
+                   len(unique_labels) - (1 if 0 in unique_labels else 0), fg_coverage)
+        
+        # 保存原始分割图
         seg_path = output_dir / f"{image_path.stem}_segmentation.png"
+        seg_image = Image.fromarray(seg_array, mode='L')
         seg_image.save(seg_path)
-        LOGGER.info("保存分割结果: %s", seg_path)
+        LOGGER.debug("保存分割图: %s", seg_path)
 
+        # ============================================================
+        # 可视化部分 - 多种输出
+        # ============================================================
         if save_visuals:
-            normalized = array.astype("float32") / max(array.max(), 1)
-            colored = cmap(normalized)[..., :3]
-            overlay = Image.fromarray((colored * 255).astype("uint8"))
-            overlay_path = output_dir / f"{image_path.stem}_overlay.png"
-            overlay.save(overlay_path)
-            LOGGER.info("保存伪彩叠加: %s", overlay_path)
+            # 1. 生成固定的类别颜色映射（使用 HSV 色彩空间保证区分度）
+            random.seed(42)  # 固定随机种子，保证颜色一致
+            
+            def generate_distinct_colors(n):
+                """生成 n 个区分度高的颜色"""
+                colors = []
+                for i in range(n):
+                    hue = i / n
+                    saturation = 0.7 + (random.random() * 0.3)  # 0.7-1.0
+                    value = 0.7 + (random.random() * 0.3)       # 0.7-1.0
+                    rgb = plt.cm.hsv(hue)[:3]
+                    # 调整饱和度和亮度
+                    rgb = np.array(rgb)
+                    rgb = rgb * value
+                    colors.append(rgb)
+                return colors
+            
+            # 为所有前景类别生成颜色
+            fg_labels = [l for l in unique_labels if l != 0]
+            if len(fg_labels) > 0:
+                class_colors = generate_distinct_colors(150)  # 为所有可能的类生成颜色
+                
+                # --------------------------------------------------------
+                # 可视化 1: 彩色分割掩码（无背景）
+                # --------------------------------------------------------
+                seg_colored = np.zeros((original_size[1], original_size[0], 3), dtype=np.uint8)
+                
+                for label in fg_labels:
+                    mask = seg_array == label
+                    color = (np.array(class_colors[label]) * 255).astype(np.uint8)
+                    seg_colored[mask] = color
+                
+                # 保存纯分割图
+                mask_only_path = output_dir / f"{image_path.stem}_mask_only.png"
+                Image.fromarray(seg_colored).save(mask_only_path)
+                LOGGER.debug("保存纯分割掩码: %s", mask_only_path)
+                
+                # --------------------------------------------------------
+                # 可视化 2: 半透明叠加
+                # --------------------------------------------------------
+                overlay_img = Image.fromarray(seg_colored)
+                alpha = 0.5
+                blended = Image.blend(image.convert('RGB'), overlay_img, alpha=alpha)
+                
+                overlay_path = output_dir / f"{image_path.stem}_overlay.png"
+                blended.save(overlay_path)
+                LOGGER.debug("保存叠加图: %s", overlay_path)
+                
+                # --------------------------------------------------------
+                # 可视化 3: 带图例的完整可视化（使用 matplotlib）
+                # --------------------------------------------------------
+                fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+                fig.suptitle(f'Segmentation Results: {image_path.name}', fontsize=16, fontweight='bold')
+                
+                # 子图 1: 原图
+                axes[0, 0].imshow(image)
+                axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
+                axes[0, 0].axis('off')
+                
+                # 子图 2: 纯分割掩码
+                axes[0, 1].imshow(seg_colored)
+                axes[0, 1].set_title('Segmentation Mask', fontsize=12, fontweight='bold')
+                axes[0, 1].axis('off')
+                
+                # 子图 3: 半透明叠加
+                axes[1, 0].imshow(blended)
+                axes[1, 0].set_title('Overlay (α=0.5)', fontsize=12, fontweight='bold')
+                axes[1, 0].axis('off')
+                
+                # 子图 4: 边界叠加
+                # 计算边界
+                from scipy import ndimage
+                boundaries = np.zeros_like(seg_array, dtype=bool)
+                for label in fg_labels:
+                    mask = seg_array == label
+                    eroded = ndimage.binary_erosion(mask)
+                    boundary = mask & ~eroded
+                    boundaries |= boundary
+                
+                # 在原图上绘制边界
+                img_with_boundaries = np.array(image).copy()
+                img_with_boundaries[boundaries] = [255, 255, 0]  # 黄色边界
+                
+                axes[1, 1].imshow(img_with_boundaries)
+                axes[1, 1].set_title('Boundaries', fontsize=12, fontweight='bold')
+                axes[1, 1].axis('off')
+                
+                # 添加图例（只显示检测到的类别）
+                legend_elements = []
+                sorted_labels = sorted(
+                    [(l, label_counts[l]) for l in fg_labels],
+                    key=lambda x: -x[1]
+                )[:15]  # 最多显示前 15 个类别
+                
+                for label, count in sorted_labels:
+                    class_name = class_names[label] if label < len(class_names) else f"class_{label}"
+                    pct = count / total_pixels * 100
+                    color = class_colors[label]
+                    legend_elements.append(
+                        Patch(facecolor=color, label=f'{class_name} ({pct:.1f}%)')
+                    )
+                
+                # 在图外添加图例
+                fig.legend(
+                    handles=legend_elements,
+                    loc='center',
+                    bbox_to_anchor=(0.5, -0.05),
+                    ncol=5,
+                    fontsize=10,
+                    frameon=True,
+                    title='Detected Classes (Top 15)',
+                    title_fontsize=12
+                )
+                
+                plt.tight_layout()
+                
+                # 保存完整可视化
+                full_vis_path = output_dir / f"{image_path.stem}_full_visualization.png"
+                plt.savefig(full_vis_path, dpi=150, bbox_inches='tight', facecolor='white')
+                plt.close(fig)
+                LOGGER.debug("保存完整可视化: %s", full_vis_path)
+                
+                # --------------------------------------------------------
+                # 可视化 4: 类别标签叠加（在图像上标注类别名）
+                # --------------------------------------------------------
+                from PIL import ImageDraw, ImageFont
+                
+                img_with_labels = image.copy()
+                draw = ImageDraw.Draw(img_with_labels)
+                
+                # 尝试加载字体
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", size=14)
+                    font_small = ImageFont.truetype("DejaVuSans.ttf", size=10)
+                except:
+                    font = ImageFont.load_default()
+                    font_small = ImageFont.load_default()
+                
+                # 为每个类别找到质心并标注
+                for label in fg_labels:
+                    mask = seg_array == label
+                    
+                    # 计算质心
+                    y_coords, x_coords = np.where(mask)
+                    if len(y_coords) == 0:
+                        continue
+                    
+                    centroid_x = int(x_coords.mean())
+                    centroid_y = int(y_coords.mean())
+                    
+                    # 获取类别信息
+                    class_name = class_names[label] if label < len(class_names) else f"class_{label}"
+                    pct = label_counts[label] / total_pixels * 100
+                    text = f"{class_name}\n{pct:.1f}%"
+                    
+                    # 获取颜色
+                    color = tuple((np.array(class_colors[label]) * 255).astype(int).tolist())
+                    
+                    # 绘制半透明背景
+                    bbox = draw.textbbox((centroid_x, centroid_y), text, font=font_small)
+                    padding = 4
+                    draw.rectangle(
+                        [bbox[0]-padding, bbox[1]-padding, bbox[2]+padding, bbox[3]+padding],
+                        fill=(0, 0, 0, 180)
+                    )
+                    
+                    # 绘制文字
+                    draw.text(
+                        (centroid_x, centroid_y),
+                        text,
+                        fill=(255, 255, 255),
+                        font=font_small,
+                        anchor="mm"
+                    )
+                    
+                    # 绘制指示点
+                    point_size = 3
+                    draw.ellipse(
+                        [centroid_x-point_size, centroid_y-point_size,
+                         centroid_x+point_size, centroid_y+point_size],
+                        fill=color,
+                        outline=(255, 255, 255),
+                        width=1
+                    )
+                
+                labeled_path = output_dir / f"{image_path.stem}_labeled.png"
+                img_with_labels.save(labeled_path)
+                LOGGER.debug("保存标注图: %s", labeled_path)
+                
+                LOGGER.info("✓ 生成了 5 种可视化输出")
+        
+        LOGGER.info("=" * 80)
 
 
 # ---------------------------------------------------------------------------
@@ -809,47 +835,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     configure_logging(args.log_level)
 
-    # 清理缓存
     if args.clear_cache:
         clear_torch_hub_cache()
 
-    # 验证 checkpoint
+    if not torch.cuda.is_available():
+        raise RuntimeError("未检测到 CUDA")
+    
+    device = args.device
+    LOGGER.info("=" * 80)
+    LOGGER.info("单卡模式: %s (float32)", device)
+    LOGGER.info("=" * 80)
+
     backbone_path = resolve_path(args.backbone)
     if not verify_checkpoint(backbone_path):
         return 1
-
-    # 确定模式
-    if args.device is not None:
-        use_single_gpu = True
-        device = args.device
-        LOGGER.info("=" * 70)
-        LOGGER.info("单卡模式: %s (float32)", device)
-        LOGGER.info("=" * 70)
-    elif args.device_map is not None:
-        use_single_gpu = False
-        apply_visible_devices(args.visible_devices)
-        LOGGER.info("=" * 70)
-        LOGGER.info("多卡模式 (float32)")
-        LOGGER.info("=" * 70)
-    else:
-        # 自动检测
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            total_gb = props.total_memory // (1024**3)
-            if total_gb >= 40:
-                use_single_gpu = True
-                device = "cuda:0"
-                LOGGER.info("=" * 70)
-                LOGGER.info("自动选择单卡模式 (%d GB, float32)", total_gb)
-                LOGGER.info("=" * 70)
-            else:
-                use_single_gpu = False
-                args.device_map = "auto"
-                LOGGER.info("=" * 70)
-                LOGGER.info("自动选择多卡模式 (%d GB, float32)", total_gb)
-                LOGGER.info("=" * 70)
-        else:
-            raise RuntimeError("未检测到 CUDA")
 
     repo_path = resolve_path(args.repo)
     input_path = resolve_path(args.input)
@@ -864,104 +863,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if need_detection and not args.detection_adapter:
-        raise ValueError("detection 需要 --detection-adapter")
+        raise ValueError("检测任务需要 --detection-adapter")
     if need_segmentation and not args.segmentation_adapter:
-        raise ValueError("segmentation 需要 --segmentation-adapter")
+        raise ValueError("分割任务需要 --segmentation-adapter")
 
-    # 多卡准备
-    available_devices: Sequence[int] = []
-    max_memory = None
-    if not use_single_gpu:
-        available_devices = ensure_minimum_gpus(args.min_gpus)
-        max_memory = build_max_memory(args.max_memory, available_devices)
-
-    # 加载检测模型
+    # 加载模型
     detection_model = None
     if need_detection:
-        LOGGER.info("-" * 70)
-        LOGGER.info("加载检测模型...")
-        detection_model = load_torch_hub_model(
+        LOGGER.info("-" * 80)
+        detection_model = load_detection_model(
             repo_path,
-            "dinov3_vit7b16_de",
-            weights=args.detection_adapter,
-            backbone_weights=args.backbone,
+            device,
+            str(backbone_path),
+            args.detection_adapter,
         )
 
-        if use_single_gpu:
-            LOGGER.info("移动检测模型到 %s (float32)", device)
-            # 直接移动到设备，不指定 dtype (默认 float32)
-            detection_model = detection_model.to(device=device)
-            detection_model.eval()
-            LOGGER.info("✓ 检测模型已加载")
-        else:
-            device_map_det, _ = prepare_device_map(
-                detection_model.model if hasattr(detection_model, "model") else detection_model,
-                device_map_option=args.device_map,
-                max_memory=max_memory,
-                no_split=args.no_split,
-            )
-            dispatch_model_if_needed(detection_model, device_map=device_map_det)
-
-    # 加载分割模型
     segmentation_model = None
-    segmentation_device = None
     if need_segmentation:
-        LOGGER.info("-" * 70)
-        LOGGER.info("加载分割模型...")
-        segmentation_model = load_torch_hub_model(
+        LOGGER.info("-" * 80)
+        segmentation_model = load_segmentation_model(
             repo_path,
-            "dinov3_vit7b16_ms",
-            weights=args.segmentation_adapter,
-            backbone_weights=args.backbone,
+            device,
+            str(backbone_path),
+            args.segmentation_adapter,
         )
-
-        if use_single_gpu:
-            LOGGER.info("移动分割模型到 %s (float32)", device)
-            segmentation_model = segmentation_model.to(device=device)
-            segmentation_model.eval()
-            segmentation_device = device
-            LOGGER.info("✓ 分割模型已加载")
-        else:
-            device_map_seg, primary_seg = prepare_device_map(
-                segmentation_model,
-                device_map_option=args.device_map,
-                max_memory=max_memory,
-                no_split=args.no_split,
-            )
-            segmentation_model, _ = dispatch_model_if_needed(
-                segmentation_model, device_map=device_map_seg
-            )
-            segmentation_device = primary_seg or "cuda:0"
 
     # 推理
-    LOGGER.info("=" * 70)
+    LOGGER.info("=" * 80)
     LOGGER.info("开始推理...")
-    LOGGER.info("=" * 70)
+    LOGGER.info("=" * 80)
 
     if detection_model is not None:
+        det_output = output_dir / "detection" if need_segmentation else output_dir
         run_detection_inference(
             detection_model,
             images,
-            output_dir / "detection" if need_segmentation else output_dir,
+            det_output,
+            device,
             save_visuals=args.save_visuals,
             confidence_threshold=args.confidence_threshold,
             max_detections=args.max_detections,
         )
 
-    if segmentation_model is not None and segmentation_device is not None:
+    if segmentation_model is not None:
+        seg_output = output_dir / "segmentation" if need_detection else output_dir
         run_segmentation_inference(
             segmentation_model,
             images,
-            output_dir / "segmentation" if need_detection else output_dir,
-            device=segmentation_device,
+            seg_output,
+            device,
             image_size=args.image_size,
             save_visuals=args.save_visuals,
             color_map=args.color_map,
         )
 
-    LOGGER.info("=" * 70)
-    LOGGER.info("完成！结果: %s", output_dir)
-    LOGGER.info("=" * 70)
+    LOGGER.info("=" * 80)
+    LOGGER.info("✓ 完成！结果保存在: %s", output_dir)
+    LOGGER.info("=" * 80)
     
     return 0
 
