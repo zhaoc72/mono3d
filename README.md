@@ -171,10 +171,9 @@ python tools/run_project.py --config configs/model_config.yaml
 
 ## 单张图像快速验证
 
-要验证官方预训练的 ViT-7B backbone 与检测/分割 Adapter 是否能够在四张 RTX 4090 上正确推理，可直接调用 Accelerate 脚本处理 COCO2017 中的测试图像 `/media/pc/D/datasets/coco2017/train2017/000000000532.jpg`：
-
+### 单卡模式 (A6000/A100/H100 推荐)
 ```bash
-# 1. 仅执行 DINOv3 检测（附带可视化）
+# 1. 仅执行 DINOv3 检测
 python tools/dinov3_accelerate_inference.py \
   --repo /media/pc/D/zhaochen/mono3d/dinov3 \
   --task detection \
@@ -182,12 +181,11 @@ python tools/dinov3_accelerate_inference.py \
   --detection-adapter /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/detection \
-  --device-map auto \
-  --visible-devices 0,1,2,3 \
-  --min-gpus 4 \
+  --device cuda:0 \
+  --dtype float16 \
   --save-visuals
 
-# 2. 仅执行 DINOv3 语义分割（保存伪彩叠加图）
+# 2. 仅执行 DINOv3 语义分割
 python tools/dinov3_accelerate_inference.py \
   --repo /media/pc/D/zhaochen/mono3d/dinov3 \
   --task segmentation \
@@ -195,13 +193,12 @@ python tools/dinov3_accelerate_inference.py \
   --segmentation-adapter /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/segmentation \
-  --device-map auto \
-  --visible-devices 0,1,2,3 \
-  --min-gpus 4 \
+  --device cuda:0 \
+  --dtype float16 \
   --save-visuals \
   --color-map Spectral
 
-# 3. 同时运行检测 + 分割，共享 backbone 并保存全部可视化
+# 3. 同时运行检测 + 分割
 python tools/dinov3_accelerate_inference.py \
   --repo /media/pc/D/zhaochen/mono3d/dinov3 \
   --task both \
@@ -210,12 +207,19 @@ python tools/dinov3_accelerate_inference.py \
   --segmentation-adapter /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth \
   --input /media/pc/D/datasets/coco2017/train2017/000000000532.jpg \
   --output /media/pc/D/zhaochen/mono3d/outputs/joint \
-  --device-map auto \
-  --visible-devices 0,1,2,3 \
-  --min-gpus 4 \
+  --device cuda:0 \
+  --dtype float16 \
   --save-visuals \
   --color-map Spectral
 ```
+
+### 多卡模式 (4x RTX 4090)
+
+如需使用多卡模式，将 `--device cuda:0` 替换为 `--device-map auto --visible-devices 0,1,2,3 --min-gpus 4`。
+
+脚本会自动检测 GPU 显存大小：
+- 单卡 ≥ 40GB → 自动使用单卡模式
+- 单卡 < 40GB → 自动使用多卡模式
 
 推理结束后：
 

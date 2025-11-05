@@ -1,11 +1,11 @@
 project:
   name: Mono3D 多流水线示例
   description: >-
-    使用 DINOv3 作为视觉主干，后续可扩展到 SAM2 与 3D Gaussian Splatting 重建。
+    使用 DINOv3 作为视觉主干，支持单卡(A6000)和多卡(4x4090)两种模式。统一使用 float32 精度。
 
 context:
-  input_path: /media/pc/D/datasets/coco2017/train2017/000000000532.jpg
-  output_dir: /media/pc/D/zhaochen/mono3d/outputs
+  input_path: /media/pc/Elements/datasets/coco2017/train2017/000000000532.jpg
+  output_dir: /media/pc/D/zhaochen/mono3d/mono3d/outputs
 
 execution:
   python: python
@@ -23,23 +23,35 @@ pipelines:
   - name: dinov3
     type: dinov3
     enabled: true
-    description: DINOv3 ViT-7B 检测与语义分割推理
-    repo_path: ../dinov3
+    description: DINOv3 ViT-7B 检测与语义分割推理 (float32)
+    repo_path: /media/pc/D/zhaochen/mono3d/dinov3
     environment:
       PYTHONPATH: "{repo_path}:{PYTHONPATH}"
     context:
+      # 核心路径配置
       backbone_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_lvd1689m.pth
       detection_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_coco.pth
       segmentation_checkpoint: /media/pc/D/zhaochen/mono3d/dinov3/checkpoints/dinov3_vit7b16_ade20k.pth
+      
+      # 输入输出配置
       input_path: "{input_path}"
       output_dir: "{output_dir}"
-    accelerate_args:
-      - --dynamo_backend
-      - no
+      
+      # 设备配置
+      device: cuda:0
+      
+      # 检测参数
+      confidence_threshold: "0.5"
+      max_detections: "100"
+      
+      # 分割参数
+      image_size: "896"
+      color_map: Spectral
+      
     tasks:
       - name: detection
-        comment: "使用 Accelerate 自动切分在四卡上执行 DINOv3 检测"
-        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        comment: "单卡 A6000 模式执行 DINOv3 检测"
+        script: tools/dinov3_accelerate_inference.py
         args:
           - --repo
           - "{repo_path}"
@@ -53,18 +65,19 @@ pipelines:
           - "{input_path}"
           - --output
           - "{output_dir}/detection"
-          - --device-map
-          - auto
-          - --visible-devices
-          - 0,1,2,3
-          - --min-gpus
-          - "4"
+          - --device
+          - "{device}"
+          - --confidence-threshold
+          - "{confidence_threshold}"
+          - --max-detections
+          - "{max_detections}"
           - --save-visuals
         env:
           DINOV3_TASK: detection
+          
       - name: segmentation
-        comment: "使用 Accelerate 自动切分在四卡上执行 DINOv3 语义分割"
-        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        comment: "单卡 A6000 模式执行 DINOv3 语义分割"
+        script: tools/dinov3_accelerate_inference.py
         args:
           - --repo
           - "{repo_path}"
@@ -78,20 +91,19 @@ pipelines:
           - "{input_path}"
           - --output
           - "{output_dir}/segmentation"
-          - --device-map
-          - auto
-          - --visible-devices
-          - 0,1,2,3
-          - --min-gpus
-          - "4"
-          - --save-visuals
+          - --device
+          - "{device}"
+          - --image-size
+          - "{image_size}"
           - --color-map
-          - Spectral
+          - "{color_map}"
+          - --save-visuals
         env:
           DINOV3_TASK: segmentation
+          
       - name: detection+segmentation
-        comment: "单次运行同时完成检测与语义分割，并保存所有可视化结果"
-        script: ../mono3d/tools/dinov3_accelerate_inference.py
+        comment: "单卡 A6000 模式同时完成检测与语义分割"
+        script: tools/dinov3_accelerate_inference.py
         args:
           - --repo
           - "{repo_path}"
@@ -107,33 +119,37 @@ pipelines:
           - "{input_path}"
           - --output
           - "{output_dir}/joint"
-          - --device-map
-          - auto
-          - --visible-devices
-          - 0,1,2,3
-          - --min-gpus
-          - "4"
-          - --save-visuals
+          - --device
+          - "{device}"
+          - --confidence-threshold
+          - "{confidence_threshold}"
+          - --max-detections
+          - "{max_detections}"
+          - --image-size
+          - "{image_size}"
           - --color-map
-          - Spectral
+          - "{color_map}"
+          - --save-visuals
         env:
           DINOV3_TASK: detection+segmentation
+          
   - name: sam2
     type: sam2
     enabled: false
     description: SAM2 掩码生成（占位配置，待实现）
-    repo_path: ../sam2
+    repo_path: /media/pc/D/zhaochen/mono3d/sam2
     environment:
       PYTHONPATH: "{repo_path}:{PYTHONPATH}"
     context:
       model_checkpoint: /media/pc/D/zhaochen/mono3d/sam2/checkpoints/sam2_model.pth
       prompt_dir: /media/pc/D/zhaochen/mono3d/prompts
     tasks: []
+    
   - name: reconstruction
     type: gaussian_splatting
     enabled: false
     description: 3D Gaussian Splatting 重建（占位配置，待实现）
-    repo_path: ../3dgs
+    repo_path: /media/pc/D/zhaochen/mono3d/3dgs
     environment:
       PYTHONPATH: "{repo_path}:{PYTHONPATH}"
     context:
